@@ -38,6 +38,39 @@ export interface IMessageRepository {
   updateStatus(id: string, status: string): Promise<void>;
 }
 
+export interface IConversationRepository {
+  findById(id: string): Promise<unknown | null>;
+  findBySourceAndExternalId(source: string, externalConversationId: string): Promise<unknown | null>;
+  /**
+   * Find-or-create a conversation idempotently on (source, externalConversationId).
+   * Returns the persisted conversation entity.
+   */
+  findOrCreate(source: string, externalConversationId: string, customerId?: string, title?: string): Promise<{
+    id: string;
+    source: string;
+    externalConversationId: string;
+    customerId?: string;
+    title?: string;
+    createdAt: Date;
+    updatedAt: Date;
+  }>;
+  /**
+   * Set the customer_id on a conversation. Called after customer resolution
+   * succeeds. Pass undefined to clear the link.
+   */
+  setCustomerId(conversationId: string, customerId: string | undefined): Promise<void>;
+  save(conv: {
+    id: string;
+    source: string;
+    externalConversationId: string;
+    customerId?: string;
+    title?: string;
+    metadataJson?: string;
+    createdAt: Date;
+    updatedAt: Date;
+  }): Promise<void>;
+}
+
 export interface IOrderRepository {
   findById(id: string): Promise<Order | null>;
   findBySourceMessageId(messageId: string): Promise<Order | null>;
@@ -71,6 +104,8 @@ export interface Message {
   source: string;
   externalMessageId: string;
   conversationId?: string;
+  /** External conversation ID from the source system; used for idempotent find-or-create. */
+  externalConversationId?: string;
   senderName?: string;
   senderPhone?: string;
   sender?: { name?: string; phone?: string };
@@ -207,6 +242,7 @@ export interface PipelineResult {
 export class MessageProcessingService {
   constructor(
     private messageRepository: IMessageRepository,
+    private conversationRepository: IConversationRepository,
     private orderRepository: IOrderRepository,
     private orderItemRepository: IOrderItemRepository,
     private taskRepository: ITaskRepository,
@@ -259,6 +295,29 @@ export class MessageProcessingService {
     const warnings: { code: string; message: string }[] = [];
 
     // ========================================
+    // Step 0: Find-or-create Conversation
+    // ========================================
+    // The conversation exists across all messages belonging to a thread.
+    // We use (source, externalConversationId) as the idempotency key.
+    // If externalConversationId is missing, fall back to a deterministic
+    // per-message conversation (one-shot messages).
+    const externalConversationId = message.externalConversationId
+      ?? `single:${message.source}:${message.externalMessageId}`;
+    const conversation = await this.conversationRepository.findOrCreate(
+      message.source,
+      externalConversationId,
+      undefined,
+      undefined
+    );
+
+    // Attach the conversationId to the message so the rest of the pipeline
+    // (and the persisted Message row) sees it.
+    const messageWithConversation: Message = {
+      ...message,
+      conversationId: conversation.id
+    };
+
+    // ========================================
     // Step 1: Parse Message
     // ========================================
     const parseInput = {
@@ -272,13 +331,22 @@ export class MessageProcessingService {
     const parsingResult = parseMessage(parseInput);
 
     // ========================================
-    // Step 2: Customer Resolution (NEW)
+    // Step 2: Customer Resolution
     // ========================================
     const customerInfo = await this.resolveCustomer(
       parsingResult.customerInfo,
       parsingResult.rawAddress,
-      message.conversationId
+      messageWithConversation.conversationId
     );
+
+    // ========================================
+    // Step 2b: Link Conversation → Customer
+    // ========================================
+    // Only link when resolution is RESOLVED. needs_review / unresolved /
+    // conflict leave customer_id NULL on the conversation.
+    if (customerInfo?.customerId && customerInfo.resolutionStatus === ResolutionStatus.Resolved) {
+      await this.conversationRepository.setCustomerId(conversation.id, customerInfo.customerId);
+    }
 
     // ========================================
     // Step 3: Product Resolution
@@ -334,13 +402,26 @@ export class MessageProcessingService {
     const reviewRequired = reviewReasons.length > 0 || ruleResult.reviewRequirement.required;
 
     // ========================================
-    // Step 6: Create Order and Items
+    // Step 5b: Persist Message (idempotent)
+    // ========================================
+    // The message row must exist before orders/tasks/audit logs because
+    // they have FK references to messages(id). The save is idempotent on
+    // (source, external_message_id) via the UNIQUE constraint.
+    await this.messageRepository.save(messageWithConversation);
+
+    // ========================================
+    // Step 6: Create Order and Items (idempotent)
     // ========================================
     let orderId: string | undefined;
 
-    if (parsingResult.items.length > 0) {
+    // Check for an existing order for this message - idempotent at the
+    // pipeline level: re-processing the same message returns the same order.
+    const existingOrder = await this.orderRepository.findBySourceMessageId(messageWithConversation.id);
+    if (existingOrder) {
+      orderId = existingOrder.id;
+    } else if (parsingResult.items.length > 0) {
       const order = await this.createOrder(
-        message,
+        messageWithConversation,
         customerInfo,
         resolvedItems,
         ruleResult
@@ -494,12 +575,20 @@ export class MessageProcessingService {
     const orderId = generateUUID();
     const now = new Date();
 
+    // Derive requestedDeliveryAt: when the extraction produced a delivery
+    // instruction, the business rule treats this as a same-day request.
+    // We do NOT invent a new date policy — we mirror the existing rule
+    // that creates a delivery task with the same-day cutoff.
+    const hasDeliveryInstruction = items.length > 0; // items present implies delivery requested
+    const requestedDeliveryAt = hasDeliveryInstruction ? new Date(now) : undefined;
+
     // Create order entity with customer ID
     const order: Order = {
       id: orderId,
       customerId: customerInfo?.customerId,
       sourceMessageId: message.id,
       orderDate: message.receivedAt,
+      requestedDeliveryAt,
       status: OrderStatus.Draft,
       discountRate: ruleResult.discountRate ?? undefined,
       discountSource: ruleResult.discountSource ?? undefined,

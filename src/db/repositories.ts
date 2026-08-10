@@ -274,6 +274,76 @@ export class InMemoryCustomerRepository implements ICustomerRepository {
 }
 
 // ============================================================
+// Conversation Repository (in-memory)
+// ============================================================
+
+export interface Conversation {
+  id: string;
+  source: string;
+  externalConversationId: string;
+  customerId?: string;
+  title?: string;
+  metadataJson?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface IConversationRepository {
+  findById(id: string): Promise<Conversation | null>;
+  findBySourceAndExternalId(source: string, externalConversationId: string): Promise<Conversation | null>;
+  findOrCreate(source: string, externalConversationId: string, customerId?: string, title?: string): Promise<Conversation>;
+  setCustomerId(conversationId: string, customerId: string | undefined): Promise<void>;
+  save(conv: Conversation): Promise<void>;
+}
+
+export class InMemoryConversationRepository implements IConversationRepository {
+  private conversations: Map<string, Conversation> = new Map();
+  private sourceExternalIndex: Map<string, string> = new Map();
+
+  private indexKey(source: string, externalConversationId: string): string {
+    return `${source}:${externalConversationId}`;
+  }
+
+  async findById(id: string): Promise<Conversation | null> {
+    return this.conversations.get(id) || null;
+  }
+
+  async findBySourceAndExternalId(source: string, externalConversationId: string): Promise<Conversation | null> {
+    const id = this.sourceExternalIndex.get(this.indexKey(source, externalConversationId));
+    return id ? this.conversations.get(id) || null : null;
+  }
+
+  async save(conv: Conversation): Promise<void> {
+    this.conversations.set(conv.id, conv);
+    this.sourceExternalIndex.set(this.indexKey(conv.source, conv.externalConversationId), conv.id);
+  }
+
+  async findOrCreate(source: string, externalConversationId: string, customerId?: string, title?: string): Promise<Conversation> {
+    const existing = await this.findBySourceAndExternalId(source, externalConversationId);
+    if (existing) return existing;
+    const conv: Conversation = {
+      id: generateUUID(),
+      source,
+      externalConversationId,
+      customerId,
+      title,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+    await this.save(conv);
+    return conv;
+  }
+
+  async setCustomerId(conversationId: string, customerId: string | undefined): Promise<void> {
+    const conv = this.conversations.get(conversationId);
+    if (conv) {
+      conv.customerId = customerId;
+      conv.updatedAt = new Date();
+    }
+  }
+}
+
+// ============================================================
 // Order Repository
 // ============================================================
 
@@ -376,6 +446,7 @@ export class InMemoryAuditLogRepository implements IAuditLogRepository {
 
 export interface Repositories {
   messageRepository: InMemoryMessageRepository;
+  conversationRepository: InMemoryConversationRepository;
   productRepository: InMemoryProductRepository;
   aliasRepository: InMemoryProductAliasRepository;
   customerRepository: InMemoryCustomerRepository;
@@ -391,6 +462,7 @@ export interface Repositories {
 export function createRepositories(): Repositories {
   // Create repositories
   const messageRepository = new InMemoryMessageRepository();
+  const conversationRepository = new InMemoryConversationRepository();
   const productRepository = new InMemoryProductRepository();
   const aliasRepository = new InMemoryProductAliasRepository();
   const customerRepository = new InMemoryCustomerRepository();
@@ -406,6 +478,7 @@ export function createRepositories(): Repositories {
   // Create MessageProcessingService with all dependencies
   const messageProcessingService = new MessageProcessingService(
     messageRepository,
+    conversationRepository,
     orderRepository,
     orderItemRepository,
     taskRepository,
@@ -419,6 +492,7 @@ export function createRepositories(): Repositories {
 
   return {
     messageRepository,
+    conversationRepository,
     productRepository,
     aliasRepository,
     customerRepository,
