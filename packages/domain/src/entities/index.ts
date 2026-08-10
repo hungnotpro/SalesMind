@@ -1,3 +1,4 @@
+export * from './Conversation.js';
 export * from './Message.js';
 export * from './Customer.js';
 export * from './Product.js';

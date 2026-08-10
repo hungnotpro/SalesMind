@@ -1,5 +1,21 @@
 /**
  * Customer entity - buyer/contact.
+ *
+ * @deprecated This is a LEGACY contract. The active domain entity lives at
+ * `src/domain/entities/Customer.ts`. New code MUST NOT import this file.
+ * PostgreSQL implementation MUST use the canonical active contract.
+ *
+ * Migration plan:
+ * - Use `Customer` from `src/domain/entities/Customer.ts` for all new code.
+ * - Persisted Customer data must include `created_at` and `updated_at`
+ *   timestamps as required by the canonical contract.
+ * - The `notes` field here is not present in the canonical contract; do
+ *   not introduce it in the persistence layer.
+ * - The `verified` and `confidence` fields are absent here; the canonical
+ *   contract requires them. Backfill during migration.
+ *
+ * This file is kept unchanged per the SM-003.4 directive
+ * ("Do not delete packages/") and is annotated for awareness.
  */
 
 import { CustomerStatus } from '../../shared/src/enums.js';
