@@ -9,8 +9,8 @@
  * 5. unresolved
  */
 
-import { ResolutionStatus, AliasSource } from '../../shared/enums.js';
-import { removeDiacritics } from '../../shared/utils.js';
+import { ResolutionStatus, AliasSource } from '../shared/enums.js';
+import { removeDiacritics } from '../shared/utils.js';
 
 // ============================================================
 // Types
@@ -69,7 +69,7 @@ export interface IProductAliasRepository {
 // ============================================================
 
 const UNIT_NORMALIZATIONS: Record<string, string> = {
-  'cái': 'cái', 'cai': 'cái', 'cÁI': 'cái', 'CÁI': 'cái', 'CÁI': 'cái',
+  'cái': 'cái', 'cai': 'cái', 'cÁI': 'cái', 'CÁI': 'cái',
   'gói': 'gói', 'goi': 'gói',
   'kg': 'kg',
   'chai': 'chai',

@@ -25,8 +25,8 @@
  * - Isolated behind findFuzzyCandidates() so a future search implementation can replace it
  */
 
-import { ResolutionStatus } from '../../shared/enums.js';
-import { removeDiacritics } from '../../shared/utils.js';
+import { ResolutionStatus } from '../shared/enums.js';
+import { removeDiacritics } from '../shared/utils.js';
 
 // ============================================================
 // Types
@@ -44,6 +44,8 @@ export interface Customer {
   status: string;
   verified: boolean;
   confidence: number;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export interface CustomerAddress {

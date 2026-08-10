@@ -2,7 +2,7 @@
  * Value objects for the domain.
  */
 
-import { MessageIntent, ResolutionStatus, TaskType } from '../shared/enums.js';
+import { MessageIntent, ResolutionStatus, TaskType } from '../../shared/enums.js';
 
 export interface OrderItemCandidate {
   rawProductName: string;

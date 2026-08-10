@@ -75,3 +75,13 @@ export enum AuditAction {
   Reject = 'reject',
   Approve = 'approve'
 }
+
+export enum TaskType {
+  Delivery = 'delivery',
+  Invoice = 'invoice',
+  PaymentFollowup = 'payment_followup',
+  ReviewOrder = 'review_order',
+  ResolveProduct = 'resolve_product',
+  ResolveCustomer = 'resolve_customer',
+  Other = 'other'
+}

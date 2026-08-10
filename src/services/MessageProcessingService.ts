@@ -88,6 +88,7 @@ export interface Order {
   sourceMessageId?: string;
   orderNumber?: string;
   orderDate: Date;
+  requestedDeliveryAt?: Date;
   status: string;
   discountRate?: number;
   discountSource?: string;
