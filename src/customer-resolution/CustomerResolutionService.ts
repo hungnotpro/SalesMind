@@ -38,6 +38,8 @@ export interface Customer {
   normalizedName: string;
   phone?: string;
   normalizedPhone?: string;
+  /** First-class list of conversation IDs this customer is associated with. */
+  conversationIds: string[];
   addresses?: CustomerAddress[];
   status: string;
   verified: boolean;

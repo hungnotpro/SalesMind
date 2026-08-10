@@ -234,6 +234,11 @@ export class InMemoryCustomerRepository implements ICustomerRepository {
   }
 
   async save(customer: Customer): Promise<void> {
+    // Validate conversationIds is a proper array (defensive)
+    if (!Array.isArray(customer.conversationIds)) {
+      throw new Error('Customer.conversationIds must be a string[]');
+    }
+
     this.customers.set(customer.id, customer);
 
     // Index by phone
@@ -248,13 +253,11 @@ export class InMemoryCustomerRepository implements ICustomerRepository {
       this.nameIndex.set(nameKey, [...existing, customer.id]);
     }
 
-    // Index by conversation if available
-    const conversations = (customer as any).conversations as string[] | undefined;
-    if (conversations) {
-      for (const convId of conversations) {
-        if (!this.conversationIndex.has(convId)) {
-          this.conversationIndex.set(convId, customer.id);
-        }
+    // Index by conversation (typed access - no `any`)
+    for (const convId of customer.conversationIds) {
+      // First conversation wins (defensive - shouldn't have duplicates)
+      if (!this.conversationIndex.has(convId)) {
+        this.conversationIndex.set(convId, customer.id);
       }
     }
   }
@@ -462,13 +465,13 @@ function seedSampleData(
       normalizedName: 'along',
       phone: '0904813024',
       normalizedPhone: '84904813024',
+      conversationIds: ['conv-001', 'conv-002'],
       addresses: [
         { rawAddress: '65B đường hiệp bình, hcm', normalizedAddress: '65b duong hiep binh, hcm', isVerified: true }
       ],
       status: 'active',
       verified: true,
-      confidence: 1.0,
-      conversations: ['conv-001']
+      confidence: 1.0
     },
     {
       id: 'cust-002',
@@ -476,6 +479,7 @@ function seedSampleData(
       normalizedName: 'minh',
       phone: '0905123456',
       normalizedPhone: '84905123456',
+      conversationIds: [],
       status: 'active',
       verified: true,
       confidence: 1.0
@@ -487,9 +491,22 @@ function seedSampleData(
       normalizedName: 'along',
       phone: '0909988776',
       normalizedPhone: '84909988776',
+      conversationIds: [],
       status: 'unverified',
       verified: false,
       confidence: 0.3
+    },
+    {
+      // Verified customer with multiple conversations
+      id: 'cust-004',
+      displayName: 'Hoa',
+      normalizedName: 'hoa',
+      phone: '0904444333',
+      normalizedPhone: '84904444333',
+      conversationIds: ['conv-multi-a', 'conv-multi-b', 'conv-multi-c'],
+      status: 'active',
+      verified: true,
+      confidence: 1.0
     }
-  ] as any[]);
+  ]);
 }
