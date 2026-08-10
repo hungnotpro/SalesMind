@@ -275,6 +275,7 @@ export class MessageProcessingService {
     // ========================================
     const customerInfo = await this.resolveCustomer(
       parsingResult.customerInfo,
+      parsingResult.rawAddress,
       message.conversationId
     );
 
@@ -398,11 +399,9 @@ export class MessageProcessingService {
    */
   private async resolveCustomer(
     candidateInfo: CustomerInfo | undefined,
+    rawAddress: string | undefined,
     conversationId?: string
   ): Promise<ProcessedCustomerInfo | undefined> {
-    // Get raw address from parsing result metadata if available
-    const rawAddress = (candidateInfo as any)?._rawAddress;
-    
     // Create customer candidate from parsing result
     const candidate = this.customerResolutionService.createCandidate({
       rawName: candidateInfo?.displayName,

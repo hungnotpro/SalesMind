@@ -250,9 +250,9 @@ export function parseMessage(input: { messageId: string; rawText: string; sender
       }
     }
     
-    // Store raw address in metadata for customer resolution
+    // Store raw address (typed - no `any` cast)
     if (rawAddress) {
-      (result as any)._rawAddress = rawAddress;
+      result.rawAddress = rawAddress;
     }
     
     if (items.length === 0 && instructions.length === 0) {

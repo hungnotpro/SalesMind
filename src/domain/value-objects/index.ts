@@ -67,6 +67,8 @@ export interface ProcessingResult {
   reviewReasons: string[];
   warnings: ProcessingWarning[];
   metadata: ProcessingMetadata;
+  /** Raw delivery address extracted from the message. Preserves the original value. */
+  rawAddress?: string;
 }
 
 export interface TaskCandidate {
