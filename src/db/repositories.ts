@@ -7,7 +7,8 @@
 
 import { MessageProcessingService, IMessageRepository, IOrderRepository, IOrderItemRepository, ITaskRepository, IAuditLogRepository, Message, Order, OrderItem, Task, AuditLog } from '../services/MessageProcessingService.js';
 import { ProductResolutionService, IProductRepository, IProductAliasRepository, Product, ProductAlias } from '../product-resolution/ProductResolutionService.js';
-import { ResolutionStatus } from '../shared/enums.js';
+import { CustomerResolutionService, ICustomerRepository, Customer, CustomerCandidate, normalizePhone, normalizeCustomerName } from '../customer-resolution/CustomerResolutionService.js';
+import { ResolutionStatus, MessageIntent } from '../shared/enums.js';
 
 // ============================================================
 // UUID Generator
@@ -88,16 +89,28 @@ export class InMemoryProductAliasRepository implements IProductAliasRepository {
   private aliases: Map<string, ProductAlias> = new Map();
   private aliasIndex: Map<string, string[]> = new Map();
   private normalizedIndex: Map<string, string[]> = new Map();
+  private customerIndex: Map<string, string[]> = new Map();
 
   async findById(id: string): Promise<ProductAlias | null> {
     return this.aliases.get(id) || null;
   }
 
   async findByExactAlias(alias: string, customerId?: string): Promise<ProductAlias | null> {
+    // First check customer-specific aliases
+    if (customerId) {
+      const customerAliases = this.customerIndex.get(customerId) || [];
+      for (const id of customerAliases) {
+        const a = this.aliases.get(id);
+        if (a && a.alias.toLowerCase() === alias.toLowerCase()) {
+          return a;
+        }
+      }
+    }
+    // Then check global aliases
     const candidates = this.aliasIndex.get(alias.toLowerCase()) || [];
     for (const id of candidates) {
       const a = this.aliases.get(id);
-      if (a && (!customerId || !a.customerId || a.customerId === customerId)) {
+      if (a && !a.customerId) {
         return a;
       }
     }
@@ -105,10 +118,26 @@ export class InMemoryProductAliasRepository implements IProductAliasRepository {
   }
 
   async findByNormalizedAlias(normalized: string, customerId?: string): Promise<ProductAlias[]> {
+    const results: ProductAlias[] = [];
+    // Check customer-specific aliases first
+    if (customerId) {
+      const customerAliases = this.customerIndex.get(customerId) || [];
+      for (const id of customerAliases) {
+        const a = this.aliases.get(id);
+        if (a && a.normalizedAlias.toLowerCase() === normalized.toLowerCase()) {
+          results.push(a);
+        }
+      }
+    }
+    // Then check global aliases
     const candidates = this.normalizedIndex.get(normalized.toLowerCase()) || [];
-    return candidates
-      .map((id) => this.aliases.get(id))
-      .filter((a) => a && (!customerId || !a.customerId || a.customerId === customerId)) as ProductAlias[];
+    for (const id of candidates) {
+      const a = this.aliases.get(id);
+      if (a && !a.customerId) {
+        results.push(a);
+      }
+    }
+    return results;
   }
 
   async findByProductId(productId: string): Promise<ProductAlias[]> {
@@ -116,7 +145,8 @@ export class InMemoryProductAliasRepository implements IProductAliasRepository {
   }
 
   async findByCustomerId(customerId: string): Promise<ProductAlias[]> {
-    return Array.from(this.aliases.values()).filter((a) => a.customerId === customerId);
+    const ids = this.customerIndex.get(customerId) || [];
+    return ids.map(id => this.aliases.get(id)).filter(Boolean) as ProductAlias[];
   }
 
   async findVerifiedGlobal(): Promise<ProductAlias[]> {
@@ -125,21 +155,107 @@ export class InMemoryProductAliasRepository implements IProductAliasRepository {
 
   async save(alias: ProductAlias): Promise<void> {
     this.aliases.set(alias.id, alias);
+    
+    // Index by alias (case-insensitive)
     const aliasKey = alias.alias.toLowerCase();
     const existing = this.aliasIndex.get(aliasKey) || [];
     if (!existing.includes(alias.id)) {
       this.aliasIndex.set(aliasKey, [...existing, alias.id]);
     }
+    
+    // Index by normalized alias
     const normalizedKey = alias.normalizedAlias.toLowerCase();
     const normExisting = this.normalizedIndex.get(normalizedKey) || [];
     if (!normExisting.includes(alias.id)) {
       this.normalizedIndex.set(normalizedKey, [...normExisting, alias.id]);
+    }
+    
+    // Index by customer
+    if (alias.customerId) {
+      const customerAliases = this.customerIndex.get(alias.customerId) || [];
+      if (!customerAliases.includes(alias.id)) {
+        this.customerIndex.set(alias.customerId, [...customerAliases, alias.id]);
+      }
     }
   }
 
   seed(aliases: ProductAlias[]): void {
     for (const alias of aliases) {
       this.save(alias);
+    }
+  }
+}
+
+// ============================================================
+// Customer Repository
+// ============================================================
+
+export class InMemoryCustomerRepository implements ICustomerRepository {
+  private customers: Map<string, Customer> = new Map();
+  private phoneIndex: Map<string, string> = new Map();
+  private nameIndex: Map<string, string[]> = new Map();
+  private conversationIndex: Map<string, string> = new Map();
+
+  async findById(id: string): Promise<Customer | null> {
+    return this.customers.get(id) || null;
+  }
+
+  async findByPhone(normalizedPhone: string): Promise<Customer | null> {
+    const id = this.phoneIndex.get(normalizedPhone);
+    return id ? this.customers.get(id) || null : null;
+  }
+
+  async findByNormalizedName(normalizedName: string): Promise<Customer[]> {
+    // Exact match
+    const exactIds = this.nameIndex.get(normalizedName.toLowerCase()) || [];
+    const exactMatches = exactIds.map(id => this.customers.get(id)).filter(Boolean) as Customer[];
+    
+    // Also find by prefix (for fuzzy search)
+    const allMatches: Customer[] = [...exactMatches];
+    const prefix = normalizedName.toLowerCase().slice(0, 3);
+    
+    for (const [name, ids] of this.nameIndex.entries()) {
+      if (name.startsWith(prefix) && !exactMatches.some(m => m.id === this.nameIndex.get(name)?.[0])) {
+        for (const id of ids) {
+          const customer = this.customers.get(id);
+          if (customer) {
+            allMatches.push(customer);
+          }
+        }
+      }
+    }
+    
+    return allMatches;
+  }
+
+  async findByConversationId(conversationId: string): Promise<Customer | null> {
+    const id = this.conversationIndex.get(conversationId);
+    return id ? this.customers.get(id) || null : null;
+  }
+
+  async save(customer: Customer): Promise<void> {
+    this.customers.set(customer.id, customer);
+    
+    // Index by phone
+    if (customer.normalizedPhone) {
+      this.phoneIndex.set(customer.normalizedPhone, customer.id);
+    }
+    
+    // Index by name
+    const nameKey = customer.normalizedName.toLowerCase();
+    const existing = this.nameIndex.get(nameKey) || [];
+    if (!existing.includes(customer.id)) {
+      this.nameIndex.set(nameKey, [...existing, customer.id]);
+    }
+  }
+
+  async update(customer: Customer): Promise<void> {
+    this.customers.set(customer.id, customer);
+  }
+
+  seed(customers: Customer[]): void {
+    for (const customer of customers) {
+      this.save(customer);
     }
   }
 }
@@ -249,53 +365,65 @@ export interface Repositories {
   messageRepository: InMemoryMessageRepository;
   productRepository: InMemoryProductRepository;
   aliasRepository: InMemoryProductAliasRepository;
+  customerRepository: InMemoryCustomerRepository;
   orderRepository: InMemoryOrderRepository;
   orderItemRepository: InMemoryOrderItemRepository;
   taskRepository: InMemoryTaskRepository;
   auditLogRepository: InMemoryAuditLogRepository;
   productResolutionService: ProductResolutionService;
+  customerResolutionService: CustomerResolutionService;
   messageProcessingService: MessageProcessingService;
 }
 
 export function createRepositories(): Repositories {
+  // Create repositories
   const messageRepository = new InMemoryMessageRepository();
   const productRepository = new InMemoryProductRepository();
   const aliasRepository = new InMemoryProductAliasRepository();
+  const customerRepository = new InMemoryCustomerRepository();
   const orderRepository = new InMemoryOrderRepository();
   const orderItemRepository = new InMemoryOrderItemRepository();
   const taskRepository = new InMemoryTaskRepository();
   const auditLogRepository = new InMemoryAuditLogRepository();
 
-  // Create ProductResolutionService
+  // Create resolution services
   const productResolutionService = new ProductResolutionService(productRepository, aliasRepository);
+  const customerResolutionService = new CustomerResolutionService(customerRepository);
 
-  // Create MessageProcessingService with ProductResolutionService
+  // Create MessageProcessingService with all dependencies
   const messageProcessingService = new MessageProcessingService(
     messageRepository,
     orderRepository,
     orderItemRepository,
     taskRepository,
     auditLogRepository,
-    productResolutionService
+    productResolutionService,
+    customerResolutionService
   );
 
   // Seed sample data
-  seedSampleData(productRepository, aliasRepository);
+  seedSampleData(productRepository, aliasRepository, customerRepository);
 
   return {
     messageRepository,
     productRepository,
     aliasRepository,
+    customerRepository,
     orderRepository,
     orderItemRepository,
     taskRepository,
     auditLogRepository,
     productResolutionService,
+    customerResolutionService,
     messageProcessingService
   };
 }
 
-function seedSampleData(productRepo: InMemoryProductRepository, aliasRepo: InMemoryProductAliasRepository): void {
+function seedSampleData(
+  productRepo: InMemoryProductRepository,
+  aliasRepo: InMemoryProductAliasRepository,
+  customerRepo: InMemoryCustomerRepository
+): void {
   // Seed sample products
   productRepo.seed([
     { id: 'prod-001', sku: 'BUN01', name: 'Bánh bao nhân bơ', normalizedName: 'banh bao nhan bo', defaultUnit: 'cái', active: true },
@@ -314,5 +442,32 @@ function seedSampleData(productRepo: InMemoryProductRepository, aliasRepo: InMem
     { id: 'alias-006', productId: 'prod-003', alias: '55 đậu', normalizedAlias: '55 dau', source: 'global', verified: true, confidence: 1.0 },
     { id: 'alias-007', productId: 'prod-004', alias: '50g cay', normalizedAlias: '50g cay', source: 'global', verified: true, confidence: 0.9 },
     { id: 'alias-008', productId: 'prod-003', alias: '55g so', normalizedAlias: '55g so', source: 'global', verified: true, confidence: 0.9 },
+  ]);
+
+  // Seed sample customers
+  customerRepo.seed([
+    {
+      id: 'cust-001',
+      displayName: 'a.Long',
+      normalizedName: 'along',
+      phone: '0904813024',
+      normalizedPhone: '840904813024',
+      addresses: [
+        { rawAddress: '65B đường hiệp bình, hcm', normalizedAddress: '65b duong hiep binh, hcm', isVerified: true }
+      ],
+      status: 'active',
+      verified: true,
+      confidence: 1.0
+    },
+    {
+      id: 'cust-002',
+      displayName: 'Minh',
+      normalizedName: 'minh',
+      phone: '0905123456',
+      normalizedPhone: '840905123456',
+      status: 'active',
+      verified: true,
+      confidence: 1.0
+    }
   ]);
 }

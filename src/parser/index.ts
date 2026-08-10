@@ -128,6 +128,32 @@ function extractName(text: string): string | null {
 }
 
 /**
+ * Extract address from text.
+ * Matches patterns like:
+ * - Đc: <address>
+ * - Địa chỉ: <address>
+ * - Address: <address>
+ */
+function extractAddress(text: string): string | null {
+  const lower = text.toLowerCase().trim();
+  
+  // Match "Đc:" or "Địa chỉ:" or similar patterns
+  const match = text.match(/^(?:đc|địa\s*chỉ|address)[:\s]+(.+)$/i);
+  if (match) {
+    return match[1].trim();
+  }
+  
+  // Check if line contains address keywords and is not an instruction
+  if (/đường|phường|quận|hcm|hn|tp\.|tp\s/i.test(text) && 
+      !/^\d+\s*(?:bơ|thịt|gà|cá|đậu)/i.test(text) &&
+      !/:?\s*\d+\s*(?:cái|gói|kg)/i.test(text)) {
+    return text.replace(/^(?:đc|địa\s*chỉ|address)\s*/i, '').trim();
+  }
+  
+  return null;
+}
+
+/**
  * Parse a raw message and extract structured information.
  */
 export function parseMessage(input: { messageId: string; rawText: string; sender?: { name?: string; phone?: string }; receivedAt?: Date; correlationId?: string }): any {
@@ -182,6 +208,8 @@ export function parseMessage(input: { messageId: string; rawText: string; sender
     result.items = items;
     
     // Extract customer info
+    let rawAddress: string | undefined;
+    
     if (input.sender) {
       result.customerInfo = {
         displayName: input.sender.name,
@@ -194,16 +222,37 @@ export function parseMessage(input: { messageId: string; rawText: string; sender
       for (const line of lines) {
         const phone = extractPhone(line);
         const name = extractName(line);
-        if (phone || name) {
+        const address = extractAddress(line);
+        
+        if (phone || name || address) {
           result.customerInfo = {
-            displayName: name,
-            phone: phone,
+            displayName: name || undefined,
+            phone: phone || undefined,
             resolutionStatus: phone ? ResolutionStatus.NeedsReview : ResolutionStatus.Unresolved,
-            confidence: phone ? 0.7 : 0.3
+            confidence: phone ? 0.7 : (name ? 0.4 : 0.2)
           };
+          if (address) {
+            rawAddress = address;
+          }
           break;
         }
       }
+    }
+    
+    // Also scan for address in all lines
+    if (!rawAddress) {
+      for (const line of lines) {
+        const address = extractAddress(line);
+        if (address) {
+          rawAddress = address;
+          break;
+        }
+      }
+    }
+    
+    // Store raw address in metadata for customer resolution
+    if (rawAddress) {
+      (result as any)._rawAddress = rawAddress;
     }
     
     if (items.length === 0 && instructions.length === 0) {

@@ -2,12 +2,12 @@
  * Message Processing Service - Full Pipeline Integration
  * 
  * Pipeline:
- * 1. Message Ingestion (idempotent)
- * 2. Parse message (intent, products, instructions)
- * 3. Product Resolution (NEW - using ProductResolutionService)
+ * 1. Parse message (intent, products, instructions)
+ * 2. Customer Resolution (resolve customer candidate)
+ * 3. Product Resolution (resolve aliases to canonical products)
  * 4. Apply business rules
  * 5. Validate
- * 6. Create order
+ * 6. Create order and items
  * 7. Create tasks
  * 8. Determine review requirements
  */
@@ -18,11 +18,14 @@ import { OrderItemCandidate, ProcessingResult, createEmptyProcessingResult, requ
 import { parseMessage } from '../parser/index.js';
 import { applyBusinessRules, DEFAULT_RULE_ENGINE_CONFIG, RuleEngineConfig } from '../rules/index.js';
 import { ProductResolutionService, normalizeUnit, IProductRepository, IProductAliasRepository, Product, ProductAlias } from '../product-resolution/ProductResolutionService.js';
+import { CustomerResolutionService, ICustomerRepository, Customer, CustomerCandidate, normalizePhone, normalizeCustomerName, CustomerResolutionResult } from '../customer-resolution/CustomerResolutionService.js';
 
 // Re-export types for external use
 export { ProductResolutionService, normalizeUnit };
 export type { IProductRepository, IProductAliasRepository, Product, ProductAlias };
 export type { ResolutionConfig, ResolutionResult } from '../product-resolution/ProductResolutionService.js';
+export { CustomerResolutionService, normalizePhone, normalizeCustomerName };
+export type { ICustomerRepository, Customer, CustomerCandidate, CustomerResolutionResult };
 
 // ============================================================
 // Repository Interfaces
@@ -151,13 +154,33 @@ export interface ProcessedOrderItem extends OrderItemCandidate {
   matchMethod?: 'exact' | 'normalized' | 'fuzzy' | 'customer' | 'none';
 }
 
+export interface ProcessedCustomerInfo extends CustomerInfo {
+  customerId?: string;
+  rawName?: string;
+  normalizedName?: string;
+  rawPhone?: string;
+  normalizedPhone?: string;
+  rawAddress?: string;
+  normalizedAddress?: string;
+  resolutionStatus: ResolutionStatus;
+  resolutionConfidence?: number;
+  matchMethod?: string;
+  conflict?: {
+    phoneCustomerId?: string;
+    phoneCustomerName?: string;
+    nameCustomerId?: string;
+    nameCustomerName?: string;
+    reason: string;
+  };
+}
+
 export interface PipelineResult {
   messageId: string;
   correlationId: string;
   rawText: string;
   intent: MessageIntent;
   intentConfidence: number;
-  customerInfo?: CustomerInfo;
+  customerInfo?: ProcessedCustomerInfo;
   items: ProcessedOrderItem[];
   instructions: ExtractedInstruction[];
   discountRate?: number;
@@ -187,7 +210,8 @@ export class MessageProcessingService {
     private orderItemRepository: IOrderItemRepository,
     private taskRepository: ITaskRepository,
     private auditLogRepository: IAuditLogRepository,
-    private productResolutionService: ProductResolutionService
+    private productResolutionService: ProductResolutionService,
+    private customerResolutionService: CustomerResolutionService
   ) {}
 
   /**
@@ -215,13 +239,14 @@ export class MessageProcessingService {
    * Process a message through the complete pipeline.
    * 
    * Pipeline:
-   * 1. Parse message (intent, products, instructions)
-   * 2. Product Resolution (resolve aliases to canonical products)
-   * 3. Apply business rules
-   * 4. Validate
-   * 5. Create order and items
-   * 6. Create tasks
-   * 7. Determine review requirements
+   * 1. Parse message (intent, products, instructions, customer candidate)
+   * 2. Customer Resolution (NEW - resolve customer candidate)
+   * 3. Product Resolution (resolve aliases to canonical products)
+   * 4. Apply business rules
+   * 5. Validate
+   * 6. Create order and items
+   * 7. Create tasks
+   * 8. Determine review requirements
    */
   async processMessage(
     message: Message,
@@ -246,15 +271,23 @@ export class MessageProcessingService {
     const parsingResult = parseMessage(parseInput);
 
     // ========================================
-    // Step 2: Product Resolution (NEW)
+    // Step 2: Customer Resolution (NEW)
     // ========================================
-    const resolvedItems = await this.resolveProducts(
-      parsingResult.items,
-      parsingResult.customerInfo?.customerId
+    const customerInfo = await this.resolveCustomer(
+      parsingResult.customerInfo,
+      message.conversationId
     );
 
     // ========================================
-    // Step 3: Apply Business Rules
+    // Step 3: Product Resolution
+    // ========================================
+    const resolvedItems = await this.resolveProducts(
+      parsingResult.items,
+      customerInfo?.customerId
+    );
+
+    // ========================================
+    // Step 4: Apply Business Rules
     // ========================================
     const ruleResult = applyBusinessRules(parsingResult, config);
 
@@ -266,14 +299,17 @@ export class MessageProcessingService {
     const uniqueTasks = this.deduplicateTasks(allTasks);
 
     // ========================================
-    // Step 4: Determine Review Requirements
+    // Step 5: Determine Review Requirements
     // ========================================
     const unresolvedItems = resolvedItems.filter(
       i => i.resolutionStatus === ResolutionStatus.NeedsReview || i.resolutionStatus === ResolutionStatus.Unresolved
     );
-    const customerNeedsReview = !parsingResult.customerInfo?.customerId &&
-      (parsingResult.customerInfo?.resolutionStatus === ResolutionStatus.NeedsReview ||
-       parsingResult.customerInfo?.resolutionStatus === ResolutionStatus.Unresolved);
+    
+    const customerNeedsReview = !customerInfo?.customerId &&
+      (customerInfo?.resolutionStatus === ResolutionStatus.NeedsReview ||
+       customerInfo?.resolutionStatus === ResolutionStatus.Unresolved);
+
+    const hasConflict = !!customerInfo?.conflict;
 
     const reviewReasons: string[] = [];
 
@@ -285,6 +321,10 @@ export class MessageProcessingService {
       reviewReasons.push('Customer could not be identified');
     }
 
+    if (hasConflict) {
+      reviewReasons.push(`Customer conflict: ${customerInfo?.conflict?.reason}`);
+    }
+
     if (parsingResult.items.length === 0) {
       reviewReasons.push('No products found');
     }
@@ -292,26 +332,27 @@ export class MessageProcessingService {
     const reviewRequired = reviewReasons.length > 0 || ruleResult.reviewRequirement.required;
 
     // ========================================
-    // Step 5: Create Order and Items
+    // Step 6: Create Order and Items
     // ========================================
     let orderId: string | undefined;
 
     if (parsingResult.items.length > 0) {
       const order = await this.createOrder(
         message,
+        customerInfo,
         resolvedItems,
         ruleResult
       );
       orderId = order.id;
 
       // ========================================
-      // Step 6: Create Tasks
+      // Step 7: Create Tasks
       // ========================================
       if (uniqueTasks.length > 0) {
         const tasks = await this.createTasks(orderId, uniqueTasks, message.id);
         
         // ========================================
-        // Step 7: Create Review Task if Needed
+        // Step 8: Create Review Task if Needed
         // ========================================
         if (reviewRequired && reviewReasons.length > 0) {
           const reviewTask = await this.createReviewTask(orderId, reviewReasons, message.id);
@@ -332,7 +373,7 @@ export class MessageProcessingService {
       rawText: message.rawText,
       intent: parsingResult.intent,
       intentConfidence: parsingResult.intentConfidence,
-      customerInfo: parsingResult.customerInfo,
+      customerInfo,
       items: resolvedItems,
       instructions: parsingResult.instructions,
       discountRate: ruleResult.discountRate,
@@ -350,6 +391,58 @@ export class MessageProcessingService {
         ruleEngineVersion: '1.0.0'
       }
     };
+  }
+
+  /**
+   * Resolve customer using CustomerResolutionService.
+   */
+  private async resolveCustomer(
+    candidateInfo: CustomerInfo | undefined,
+    conversationId?: string
+  ): Promise<ProcessedCustomerInfo | undefined> {
+    // Get raw address from parsing result metadata if available
+    const rawAddress = (candidateInfo as any)?._rawAddress;
+    
+    // Create customer candidate from parsing result
+    const candidate = this.customerResolutionService.createCandidate({
+      rawName: candidateInfo?.displayName,
+      rawPhone: candidateInfo?.phone,
+      rawAddress: rawAddress
+    });
+
+    // Resolve using evidence hierarchy
+    const resolution = await this.customerResolutionService.resolve(candidate, conversationId);
+
+    // Build ProcessedCustomerInfo
+    const result: ProcessedCustomerInfo = {
+      resolutionStatus: resolution.resolutionStatus,
+      resolutionConfidence: resolution.confidence,
+      matchMethod: resolution.matchMethod,
+      conflict: resolution.conflict
+    };
+
+    if (resolution.customer) {
+      result.customerId = resolution.customer.id;
+      result.displayName = resolution.customer.displayName;
+      result.phone = resolution.customer.phone;
+      result.normalizedName = resolution.customer.normalizedName;
+      result.normalizedPhone = resolution.customer.normalizedPhone;
+      result.rawName = candidate.rawName;
+      result.rawPhone = candidate.rawPhone;
+      result.rawAddress = rawAddress || resolution.customer.addresses?.[0]?.rawAddress;
+      result.normalizedAddress = resolution.customer.addresses?.[0]?.normalizedAddress;
+    } else {
+      // No match found, use candidate info
+      result.displayName = candidate.rawName;
+      result.phone = candidate.rawPhone;
+      result.normalizedName = candidate.normalizedName;
+      result.normalizedPhone = candidate.normalizedPhone;
+      result.rawName = candidate.rawName;
+      result.rawPhone = candidate.rawPhone;
+      result.rawAddress = rawAddress;
+    }
+
+    return result;
   }
 
   /**
@@ -394,23 +487,17 @@ export class MessageProcessingService {
    */
   private async createOrder(
     message: Message,
+    customerInfo: ProcessedCustomerInfo | undefined,
     items: ProcessedOrderItem[],
     ruleResult: ReturnType<typeof applyBusinessRules>
   ): Promise<Order> {
     const orderId = generateUUID();
     const now = new Date();
 
-    // Resolve customer if available
-    let customerId: string | undefined;
-    if (message.senderPhone) {
-      // In production, would look up customer by phone
-      customerId = undefined;
-    }
-
-    // Create order entity
+    // Create order entity with customer ID
     const order: Order = {
       id: orderId,
-      customerId,
+      customerId: customerInfo?.customerId,
       sourceMessageId: message.id,
       orderDate: message.receivedAt,
       status: OrderStatus.Draft,
@@ -420,6 +507,7 @@ export class MessageProcessingService {
       paymentSource: ruleResult.paymentSource ?? undefined,
       invoiceRequired: ruleResult.invoiceRequired,
       invoiceDueAt: ruleResult.invoiceDueAt ?? undefined,
+      notes: customerInfo?.rawAddress ? `Delivery: ${customerInfo.rawAddress}` : undefined,
       createdAt: now,
       updatedAt: now
     };
