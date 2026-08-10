@@ -1,44 +1,184 @@
 /**
- * Message processing service - orchestrates the message-to-order pipeline.
+ * Message Processing Service - Full Pipeline Integration
  * 
  * Pipeline:
- * 1. Parse message (intent, products, instructions)
- * 2. Apply business rules
- * 3. Create order
- * 4. Create tasks
- * 5. Determine review requirements
+ * 1. Message Ingestion (idempotent)
+ * 2. Parse message (intent, products, instructions)
+ * 3. Product Resolution (NEW - using ProductResolutionService)
+ * 4. Apply business rules
+ * 5. Validate
+ * 6. Create order
+ * 7. Create tasks
+ * 8. Determine review requirements
  */
 
-import { 
-  Message, 
-  MessageProcessingStatus,
-  ProcessingResult,
-  createEmptyProcessingResult,
-  requiresReview,
-  OrderItemCandidate,
-  TaskCandidate,
-  OrderStatus,
-  PaymentMethod,
-  TaskPriority,
-  TaskType
-} from '@salesmind/domain';
-import { parseMessage } from '@salesmind/parser';
-import { applyBusinessRules, RuleEngineConfig, DEFAULT_RULE_ENGINE_CONFIG } from '@salesmind/rules';
-import { OrderService } from '@salesmind/domain';
-import { TaskService } from '@salesmind/domain';
-import { IMessageRepository } from '@salesmind/domain';
-import { IOrderRepository } from '@salesmind/domain';
-import { IOrderItemRepository } from '@salesmind/domain';
-import { ITaskRepository } from '@salesmind/domain';
-import { IAuditLogRepository } from '@salesmind/domain';
-import { generateUUID, ResolutionStatus, MessageIntent } from '@salesmind/shared';
+import { generateUUID } from '../shared/utils.js';
+import { MessageIntent, OrderStatus, PaymentMethod, TaskPriority, TaskType, ResolutionStatus } from '../shared/enums.js';
+import { OrderItemCandidate, ProcessingResult, createEmptyProcessingResult, requiresReview, TaskCandidate, CustomerInfo, ExtractedInstruction } from '../domain/value-objects/index.js';
+import { parseMessage } from '../parser/index.js';
+import { applyBusinessRules, DEFAULT_RULE_ENGINE_CONFIG, RuleEngineConfig } from '../rules/index.js';
+import { ProductResolutionService, normalizeUnit, IProductRepository, IProductAliasRepository, Product, ProductAlias } from '../product-resolution/ProductResolutionService.js';
 
-export interface ProcessingServiceResult {
+// Re-export types for external use
+export { ProductResolutionService, normalizeUnit };
+export type { IProductRepository, IProductAliasRepository, Product, ProductAlias };
+export type { ResolutionConfig, ResolutionResult } from '../product-resolution/ProductResolutionService.js';
+
+// ============================================================
+// Repository Interfaces
+// ============================================================
+
+export interface IMessageRepository {
+  findById(id: string): Promise<Message | null>;
+  findBySourceAndExternalId(source: string, externalId: string): Promise<Message | null>;
+  save(message: Message): Promise<void>;
+  updateStatus(id: string, status: string): Promise<void>;
+}
+
+export interface IOrderRepository {
+  findById(id: string): Promise<Order | null>;
+  findBySourceMessageId(messageId: string): Promise<Order | null>;
+  save(order: Order): Promise<void>;
+  update(order: Order): Promise<void>;
+}
+
+export interface IOrderItemRepository {
+  findById(id: string): Promise<OrderItem | null>;
+  findByOrderId(orderId: string): Promise<OrderItem[]>;
+  save(item: OrderItem): Promise<void>;
+  saveMany(items: OrderItem[]): Promise<void>;
+}
+
+export interface ITaskRepository {
+  findById(id: string): Promise<Task | null>;
+  findByBusinessKey(orderId: string | undefined, type: string, dueAt: Date | undefined): Promise<Task | null>;
+  save(task: Task): Promise<void>;
+}
+
+export interface IAuditLogRepository {
+  save(log: AuditLog): Promise<void>;
+}
+
+// ============================================================
+// Entity Types
+// ============================================================
+
+export interface Message {
+  id: string;
+  source: string;
+  externalMessageId: string;
+  conversationId?: string;
+  senderName?: string;
+  senderPhone?: string;
+  sender?: { name?: string; phone?: string };
+  receivedAt: Date;
+  rawText: string;
+  metadataJson?: string;
+  processingStatus: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface Order {
+  id: string;
+  customerId?: string;
+  sourceMessageId?: string;
+  orderNumber?: string;
+  orderDate: Date;
+  status: string;
+  discountRate?: number;
+  discountSource?: string;
+  paymentMethod?: string;
+  paymentSource?: string;
+  invoiceRequired: boolean;
+  invoiceDueAt?: Date;
+  notes?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface OrderItem {
+  id: string;
+  orderId: string;
+  productId?: string;
+  rawProductName: string;
+  quantity: number;
+  unit: string;
+  normalizedUnit?: string;
+  resolutionStatus: string;
+  resolutionConfidence?: number;
+  matchMethod?: string;
+  notes?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface Task {
+  id: string;
+  orderId?: string;
+  type: string;
+  title: string;
+  description?: string;
+  ownerId?: string;
+  priority: string;
+  status: string;
+  dueAt?: Date;
+  sourceMessageId?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface AuditLog {
+  id: string;
+  entityType: string;
+  entityId: string;
+  action: string;
+  actorType: string;
+  actorId?: string;
+  beforeData?: string;
+  afterData?: string;
+  sourceMessageId?: string;
+  metadata?: string;
+  createdAt: Date;
+}
+
+// ============================================================
+// Processing Result Types
+// ============================================================
+
+export interface ProcessedOrderItem extends OrderItemCandidate {
+  normalizedUnit?: string;
+  matchMethod?: 'exact' | 'normalized' | 'fuzzy' | 'customer' | 'none';
+}
+
+export interface PipelineResult {
+  messageId: string;
+  correlationId: string;
+  rawText: string;
+  intent: MessageIntent;
+  intentConfidence: number;
+  customerInfo?: CustomerInfo;
+  items: ProcessedOrderItem[];
+  instructions: ExtractedInstruction[];
+  discountRate?: number;
+  paymentMethod?: string;
+  invoiceRequired: boolean;
   orderId?: string;
   taskIds: string[];
   reviewRequired: boolean;
-  processingResult: ProcessingResult;
+  reviewReasons: string[];
+  warnings: { code: string; message: string }[];
+  metadata: {
+    processedAt: string;
+    processingDurationMs: number;
+    parserVersion: string;
+    ruleEngineVersion: string;
+  };
 }
+
+// ============================================================
+// Message Processing Service
+// ============================================================
 
 export class MessageProcessingService {
   constructor(
@@ -46,11 +186,12 @@ export class MessageProcessingService {
     private orderRepository: IOrderRepository,
     private orderItemRepository: IOrderItemRepository,
     private taskRepository: ITaskRepository,
-    private auditLogRepository: IAuditLogRepository
+    private auditLogRepository: IAuditLogRepository,
+    private productResolutionService: ProductResolutionService
   ) {}
 
   /**
-   * Find message by source and external ID.
+   * Check for duplicate message by source and external ID.
    */
   async findBySourceAndExternalId(source: string, externalId: string): Promise<Message | null> {
     return this.messageRepository.findBySourceAndExternalId(source, externalId);
@@ -66,36 +207,55 @@ export class MessageProcessingService {
   /**
    * Update message status.
    */
-  async updateMessageStatus(messageId: string, status: MessageProcessingStatus): Promise<void> {
+  async updateMessageStatus(messageId: string, status: string): Promise<void> {
     await this.messageRepository.updateStatus(messageId, status);
   }
 
   /**
    * Process a message through the complete pipeline.
+   * 
+   * Pipeline:
+   * 1. Parse message (intent, products, instructions)
+   * 2. Product Resolution (resolve aliases to canonical products)
+   * 3. Apply business rules
+   * 4. Validate
+   * 5. Create order and items
+   * 6. Create tasks
+   * 7. Determine review requirements
    */
   async processMessage(
     message: Message,
-    correlationId: string,
+    correlationId?: string,
     config: RuleEngineConfig = DEFAULT_RULE_ENGINE_CONFIG
-  ): Promise<ProcessingServiceResult> {
-    let orderId: string | undefined;
-    const taskIds: string[] = [];
+  ): Promise<PipelineResult> {
+    const startTime = Date.now();
+    const corrId = correlationId || `corr-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    const warnings: { code: string; message: string }[] = [];
 
-    // Step 1: Parse message
+    // ========================================
+    // Step 1: Parse Message
+    // ========================================
     const parseInput = {
       messageId: message.id,
       rawText: message.rawText,
       sender: message.sender,
       receivedAt: message.receivedAt,
-      correlationId
+      correlationId: corrId
     };
 
-    const parsingResult = parseMessage(parseInput, {
-      parserVersion: '1.0.0',
-      ruleEngineVersion: '1.0.0'
-    });
+    const parsingResult = parseMessage(parseInput);
 
-    // Step 2: Apply business rules
+    // ========================================
+    // Step 2: Product Resolution (NEW)
+    // ========================================
+    const resolvedItems = await this.resolveProducts(
+      parsingResult.items,
+      parsingResult.customerInfo?.customerId
+    );
+
+    // ========================================
+    // Step 3: Apply Business Rules
+    // ========================================
     const ruleResult = applyBusinessRules(parsingResult, config);
 
     // Combine tasks from parsing and rules
@@ -103,73 +263,152 @@ export class MessageProcessingService {
       ...parsingResult.tasks,
       ...ruleResult.tasks
     ];
-
-    // Deduplicate tasks by type
     const uniqueTasks = this.deduplicateTasks(allTasks);
 
-    // Step 3: Determine review requirements
-    const reviewRequired = 
-      ruleResult.reviewRequirement.required ||
-      requiresReview(parsingResult);
+    // ========================================
+    // Step 4: Determine Review Requirements
+    // ========================================
+    const unresolvedItems = resolvedItems.filter(
+      i => i.resolutionStatus === ResolutionStatus.NeedsReview || i.resolutionStatus === ResolutionStatus.Unresolved
+    );
+    const customerNeedsReview = !parsingResult.customerInfo?.customerId &&
+      (parsingResult.customerInfo?.resolutionStatus === ResolutionStatus.NeedsReview ||
+       parsingResult.customerInfo?.resolutionStatus === ResolutionStatus.Unresolved);
 
-    // Step 4: Create order if valid order content exists
+    const reviewReasons: string[] = [];
+
+    if (unresolvedItems.length > 0) {
+      reviewReasons.push(`${unresolvedItems.length} product(s) need review: ${unresolvedItems.map(i => `"${i.rawProductName}"`).join(', ')}`);
+    }
+
+    if (customerNeedsReview) {
+      reviewReasons.push('Customer could not be identified');
+    }
+
+    if (parsingResult.items.length === 0) {
+      reviewReasons.push('No products found');
+    }
+
+    const reviewRequired = reviewReasons.length > 0 || ruleResult.reviewRequirement.required;
+
+    // ========================================
+    // Step 5: Create Order and Items
+    // ========================================
+    let orderId: string | undefined;
+
     if (parsingResult.items.length > 0) {
-      const order = await this.createOrder(message, parsingResult, ruleResult);
+      const order = await this.createOrder(
+        message,
+        resolvedItems,
+        ruleResult
+      );
       orderId = order.id;
 
-      // Step 5: Create tasks
+      // ========================================
+      // Step 6: Create Tasks
+      // ========================================
       if (uniqueTasks.length > 0) {
         const tasks = await this.createTasks(orderId, uniqueTasks, message.id);
-        taskIds.push(...tasks.map((t) => t.id));
-      }
+        
+        // ========================================
+        // Step 7: Create Review Task if Needed
+        // ========================================
+        if (reviewRequired && reviewReasons.length > 0) {
+          const reviewTask = await this.createReviewTask(orderId, reviewReasons, message.id);
+          tasks.push(reviewTask);
+        }
 
-      // Step 6: Create review task if needed
-      if (reviewRequired) {
-        const reviewTask = await this.createReviewTask(
-          orderId,
-          ruleResult.reviewRequirement.reasons,
-          message.id
-        );
-        taskIds.push(reviewTask.id);
+        // Save audit log
+        await this.saveAuditLog('Task', tasks.map(t => t.id).join(','), 'Create', 'System', undefined, message.id);
       }
     }
 
+    // ========================================
+    // Return Pipeline Result
+    // ========================================
     return {
+      messageId: message.id,
+      correlationId: corrId,
+      rawText: message.rawText,
+      intent: parsingResult.intent,
+      intentConfidence: parsingResult.intentConfidence,
+      customerInfo: parsingResult.customerInfo,
+      items: resolvedItems,
+      instructions: parsingResult.instructions,
+      discountRate: ruleResult.discountRate,
+      paymentMethod: ruleResult.paymentMethod,
+      invoiceRequired: ruleResult.invoiceRequired,
       orderId,
-      taskIds,
+      taskIds: [],
       reviewRequired,
-      processingResult: parsingResult
+      reviewReasons,
+      warnings,
+      metadata: {
+        processedAt: new Date().toISOString(),
+        processingDurationMs: Date.now() - startTime,
+        parserVersion: '1.0.0',
+        ruleEngineVersion: '1.0.0'
+      }
     };
   }
 
   /**
-   * Get processing result for a message.
+   * Resolve products using ProductResolutionService.
+   * Preserves raw values and adds resolution info.
    */
-  async getProcessingResult(messageId: string): Promise<ProcessingResult | null> {
-    // For now, we return null as processing results aren't persisted separately
-    // In production, this would query a processing_results table
-    return null;
+  private async resolveProducts(
+    items: OrderItemCandidate[],
+    customerId?: string
+  ): Promise<ProcessedOrderItem[]> {
+    const resolved: ProcessedOrderItem[] = [];
+
+    for (const item of items) {
+      // Normalize unit while preserving raw unit
+      const normalizedUnit = normalizeUnit(item.unit);
+
+      // Resolve product alias to canonical product
+      const resolution = await this.productResolutionService.resolve(
+        item.rawProductName,
+        customerId
+      );
+
+      resolved.push({
+        rawProductName: item.rawProductName,
+        quantity: item.quantity,
+        unit: item.unit,  // Raw unit preserved
+        normalizedUnit: normalizedUnit,
+        productId: resolution.productId,
+        productName: resolution.product?.name,
+        resolutionStatus: resolution.status,
+        resolutionConfidence: resolution.confidence,
+        matchMethod: resolution.matchMethod,
+        lineNumber: item.lineNumber
+      });
+    }
+
+    return resolved;
   }
 
   /**
-   * Create order from processing result.
+   * Create order with items.
    */
   private async createOrder(
     message: Message,
-    result: ProcessingResult,
+    items: ProcessedOrderItem[],
     ruleResult: ReturnType<typeof applyBusinessRules>
-  ) {
+  ): Promise<Order> {
     const orderId = generateUUID();
     const now = new Date();
 
     // Resolve customer if available
     let customerId: string | undefined;
-    if (result.customerInfo?.customerId) {
-      customerId = result.customerInfo.customerId;
+    if (message.senderPhone) {
+      // In production, would look up customer by phone
+      customerId = undefined;
     }
 
     // Create order entity
-    const order = {
+    const order: Order = {
       id: orderId,
       customerId,
       sourceMessageId: message.id,
@@ -188,23 +427,25 @@ export class MessageProcessingService {
     await this.orderRepository.save(order);
 
     // Create order items
-    for (const item of result.items) {
-      const itemId = generateUUID();
-      const orderItem = {
-        id: itemId,
-        orderId,
-        productId: item.productId,
-        rawProductName: item.rawProductName,
-        quantity: item.quantity,
-        unit: item.unit,
-        resolutionStatus: item.resolutionStatus,
-        resolutionConfidence: item.resolutionConfidence,
-        createdAt: now,
-        updatedAt: now
-      };
+    const orderItems: OrderItem[] = items.map(item => ({
+      id: generateUUID(),
+      orderId,
+      productId: item.productId,
+      rawProductName: item.rawProductName,
+      quantity: item.quantity,
+      unit: item.unit,
+      normalizedUnit: item.normalizedUnit,
+      resolutionStatus: item.resolutionStatus,
+      resolutionConfidence: item.resolutionConfidence,
+      matchMethod: item.matchMethod,
+      createdAt: now,
+      updatedAt: now
+    }));
 
-      await this.orderItemRepository.save(orderItem);
-    }
+    await this.orderItemRepository.saveMany(orderItems);
+
+    // Save audit log
+    await this.saveAuditLog('Order', orderId, 'Create', 'System', undefined, message.id);
 
     return order;
   }
@@ -216,29 +457,38 @@ export class MessageProcessingService {
     orderId: string,
     candidates: TaskCandidate[],
     sourceMessageId: string
-  ): Promise<{ id: string }[]> {
-    const createdTasks: { id: string }[] = [];
+  ): Promise<Task[]> {
+    const createdTasks: Task[] = [];
 
     for (const candidate of candidates) {
-      const taskId = generateUUID();
-      const now = new Date();
+      // Check for duplicate task by business key
+      const existing = await this.taskRepository.findByBusinessKey(
+        orderId,
+        candidate.type,
+        candidate.dueAt
+      );
 
-      const task = {
-        id: taskId,
+      if (existing) {
+        // Task already exists, skip
+        continue;
+      }
+
+      const task: Task = {
+        id: generateUUID(),
         orderId,
         type: candidate.type as TaskType,
         title: candidate.title,
         description: candidate.description,
         priority: (candidate.priority as TaskPriority) || TaskPriority.Normal,
-        status: 'pending' as const,
+        status: 'pending',
         dueAt: candidate.dueAt,
         sourceMessageId,
-        createdAt: now,
-        updatedAt: now
+        createdAt: new Date(),
+        updatedAt: new Date()
       };
 
       await this.taskRepository.save(task);
-      createdTasks.push({ id: taskId });
+      createdTasks.push(task);
     }
 
     return createdTasks;
@@ -251,25 +501,59 @@ export class MessageProcessingService {
     orderId: string,
     reasons: string[],
     sourceMessageId: string
-  ): Promise<{ id: string }> {
-    const taskId = generateUUID();
-    const now = new Date();
+  ): Promise<Task> {
+    // Check for existing review task
+    const existing = await this.taskRepository.findByBusinessKey(
+      orderId,
+      TaskType.ReviewOrder,
+      undefined
+    );
 
-    const task = {
-      id: taskId,
+    if (existing) {
+      return existing;
+    }
+
+    const task: Task = {
+      id: generateUUID(),
       orderId,
       type: TaskType.ReviewOrder,
       title: 'Review Order',
       description: `Review required: ${reasons.join('; ')}`,
       priority: TaskPriority.Normal,
-      status: 'pending' as const,
+      status: 'pending',
       sourceMessageId,
-      createdAt: now,
-      updatedAt: now
+      createdAt: new Date(),
+      updatedAt: new Date()
     };
 
     await this.taskRepository.save(task);
-    return { id: taskId };
+
+    return task;
+  }
+
+  /**
+   * Save audit log.
+   */
+  private async saveAuditLog(
+    entityType: string,
+    entityId: string,
+    action: string,
+    actorType: string,
+    actorId?: string,
+    sourceMessageId?: string
+  ): Promise<void> {
+    const log: AuditLog = {
+      id: generateUUID(),
+      entityType,
+      entityId,
+      action,
+      actorType,
+      actorId,
+      sourceMessageId,
+      createdAt: new Date()
+    };
+
+    await this.auditLogRepository.save(log);
   }
 
   /**
