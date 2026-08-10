@@ -209,11 +209,11 @@ export class InMemoryCustomerRepository implements ICustomerRepository {
     // Exact match
     const exactIds = this.nameIndex.get(normalizedName.toLowerCase()) || [];
     const exactMatches = exactIds.map(id => this.customers.get(id)).filter(Boolean) as Customer[];
-    
+
     // Also find by prefix (for fuzzy search)
     const allMatches: Customer[] = [...exactMatches];
     const prefix = normalizedName.toLowerCase().slice(0, 3);
-    
+
     for (const [name, ids] of this.nameIndex.entries()) {
       if (name.startsWith(prefix) && !exactMatches.some(m => m.id === this.nameIndex.get(name)?.[0])) {
         for (const id of ids) {
@@ -224,7 +224,7 @@ export class InMemoryCustomerRepository implements ICustomerRepository {
         }
       }
     }
-    
+
     return allMatches;
   }
 
@@ -235,17 +235,27 @@ export class InMemoryCustomerRepository implements ICustomerRepository {
 
   async save(customer: Customer): Promise<void> {
     this.customers.set(customer.id, customer);
-    
+
     // Index by phone
     if (customer.normalizedPhone) {
       this.phoneIndex.set(customer.normalizedPhone, customer.id);
     }
-    
+
     // Index by name
     const nameKey = customer.normalizedName.toLowerCase();
     const existing = this.nameIndex.get(nameKey) || [];
     if (!existing.includes(customer.id)) {
       this.nameIndex.set(nameKey, [...existing, customer.id]);
+    }
+
+    // Index by conversation if available
+    const conversations = (customer as any).conversations as string[] | undefined;
+    if (conversations) {
+      for (const convId of conversations) {
+        if (!this.conversationIndex.has(convId)) {
+          this.conversationIndex.set(convId, customer.id);
+        }
+      }
     }
   }
 
@@ -451,23 +461,35 @@ function seedSampleData(
       displayName: 'a.Long',
       normalizedName: 'along',
       phone: '0904813024',
-      normalizedPhone: '840904813024',
+      normalizedPhone: '84904813024',
       addresses: [
         { rawAddress: '65B đường hiệp bình, hcm', normalizedAddress: '65b duong hiep binh, hcm', isVerified: true }
       ],
       status: 'active',
       verified: true,
-      confidence: 1.0
+      confidence: 1.0,
+      conversations: ['conv-001']
     },
     {
       id: 'cust-002',
       displayName: 'Minh',
       normalizedName: 'minh',
       phone: '0905123456',
-      normalizedPhone: '840905123456',
+      normalizedPhone: '84905123456',
       status: 'active',
       verified: true,
       confidence: 1.0
+    },
+    {
+      // Unverified customer - name should NOT count as strong evidence
+      id: 'cust-003',
+      displayName: 'a.Long',
+      normalizedName: 'along',
+      phone: '0909988776',
+      normalizedPhone: '84909988776',
+      status: 'unverified',
+      verified: false,
+      confidence: 0.3
     }
-  ]);
+  ] as any[]);
 }
