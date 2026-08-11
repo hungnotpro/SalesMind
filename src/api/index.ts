@@ -1,11 +1,13 @@
 /**
  * SalesMind OS — public API surface.
  *
- * Exposes the controllers, validation, HTTP transport, and read-model
- * helpers for callers.
+ * Exposes the controllers, validation, HTTP transport, read-model
+ * helpers, and production bootstrap for callers.
  *
  * Architecture:
  *
+ *   Production bootstrap (bootstrap.ts)
+ *        ↓
  *   HTTP Transport (server.ts)            <- HTTP / JSON
  *        ↓
  *   Controller (messages.ts)              <- request validation + response shaping
@@ -26,6 +28,7 @@ export {
   type IngestMessageApiResponse,
   type ErrorApiResponse,
   type IngestMessageControllerOptions,
+  type IngestMessageControllerTestOptions,
   type PipelineInvoker,
   type IdempotencyLookup,
   type ApiLogger,
@@ -55,3 +58,17 @@ export {
   isUniqueViolation,
   type UniqueConstraintError
 } from './persistence-errors.js';
+
+export {
+  bootstrapMessageApiServer,
+  createPostgresIdempotencyLookup,
+  createPostgresPipelineInvoker,
+  type BootstrapDependencies,
+  type BootstrapResult
+} from './bootstrap.js';
+
+export {
+  type PgPoolLike,
+  isPgPoolLike,
+  asPgPoolLike
+} from './pg-connection.js';

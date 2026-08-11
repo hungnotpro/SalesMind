@@ -18,6 +18,9 @@ import type { Server } from 'node:http';
 import {
   IngestMessageController,
   MessageApiServer,
+  bootstrapMessageApiServer,
+  createPostgresIdempotencyLookup,
+  createPostgresPipelineInvoker,
   reconstructPipelineResult,
   type IngestMessageApiResponse,
   type ErrorApiResponse,
@@ -169,7 +172,7 @@ await repos.productAliasRepository.save({
     });
   };
 
-  const ctrl = new IngestMessageController({
+  const ctrl = IngestMessageController.createForTest({
     invoker,
     idempotencyLookup
   });
@@ -559,3 +562,227 @@ describe('SM-005 E2E: HTTP API ↔ PostgreSQL pipeline', () => {
     expect(body.data.correlationId).not.toBe(body.data.conversationId);
   });
 });
+
+// ============================================================
+// SM-005.2 — Mandatory idempotency lookup in production wiring
+// ============================================================
+
+/**
+ * These tests verify that:
+ *
+ *   1. `IngestMessageController.create()` throws when idempotencyLookup
+ *      is missing — there is no silent fallback.
+ *
+ *   2. The production bootstrap wires a real PostgreSQL-backed
+ *      IdempotencyLookup into the controller.
+ *
+ *   3. Duplicate sequential POSTs return replay.
+ *
+ *   4. Concurrent duplicate POSTs return the same persisted result.
+ *
+ *   5. No fake/mock lookup exists in production wiring.
+ */
+describe('SM-005.2: Production wiring requires idempotencyLookup', () => {
+  // ========================================
+  // Type-level guard: production factory throws without idempotencyLookup
+  // ========================================
+  it('IngestMessageController.create throws when idempotencyLookup is missing', () => {
+    // Cast: bypass the type-level check to verify the runtime guard.
+    // This is exactly the production-construction contract we want to
+    // enforce: missing idempotencyLookup must throw, not silently
+    // fall back.
+    expect(() => {
+      IngestMessageController.create({
+        invoker: async () => makePipelineResult()
+      } as unknown as Parameters<typeof IngestMessageController.create>[0]);
+    }).toThrow(/idempotencyLookup/);
+  });
+
+  it('IngestMessageController.create accepts a real IdempotencyLookup', () => {
+    const ctrl = IngestMessageController.create({
+      invoker: async () => makePipelineResult(),
+      idempotencyLookup: async () => null
+    });
+    expect(ctrl).toBeDefined();
+  });
+
+  it('createForTest allows omission (test-only path)', () => {
+    const ctrl = IngestMessageController.createForTest({
+      invoker: async () => makePipelineResult()
+    });
+    expect(ctrl).toBeDefined();
+  });
+
+  it('createForTest still works when a lookup is provided', () => {
+    const ctrl = IngestMessageController.createForTest({
+      invoker: async () => makePipelineResult(),
+      idempotencyLookup: async () => null
+    });
+    expect(ctrl).toBeDefined();
+  });
+
+  it('production wiring uses a real PostgreSQL-backed IdempotencyLookup (no mocks)', () => {
+    if (!available || !pool) return;
+    const lookup = createPostgresIdempotencyLookup(pool);
+    // The lookup is a real async function reading the database
+    expect(typeof lookup).toBe('function');
+    // Calling it must NOT throw on missing rows; it returns null
+    return lookup('nonexistent-source', 'nonexistent-external-id').then((r) => {
+      expect(r).toBeNull();
+    });
+  });
+
+  it('production wiring uses a real transactional PipelineInvoker (no mocks)', () => {
+    if (!available || !pool) return;
+    const invoker = createPostgresPipelineInvoker(pool);
+    expect(typeof invoker).toBe('function');
+    // The invoker must be an async function — calling it without a
+    // pool-bound pipeline will exercise the transaction path. We do
+    // not call it here to avoid mutating the DB in this test.
+  });
+});
+
+describe('SM-005.2: bootstrapMessageApiServer wires production components', () => {
+  it('produces a fully-wired server backed by the real PostgreSQL lookup and invoker', async () => {
+    if (!available || !pool) return;
+
+    // Stop the shared server while bootstrap is running to avoid port
+    // conflicts (we will reuse `pool`).
+    if (server) await server.close();
+    if (httpServer) await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
+    server = undefined;
+    httpServer = undefined;
+
+    const boot = await bootstrapMessageApiServer({ pool, runMigrations: false });
+    expect(boot.controller).toBeDefined();
+    expect(boot.server).toBeDefined();
+    expect(boot.pool).toBe(pool);
+    expect(typeof boot.idempotencyLookup).toBe('function');
+    expect(typeof boot.invoker).toBe('function');
+
+    // Boot the server, exercise it, then tear down.
+    const httpS = await boot.server.listen();
+    const addr = httpS.address();
+    if (typeof addr !== 'object' || !addr) throw new Error('bind failed');
+    const bootUrl = `http://127.0.0.1:${addr.port}`;
+
+    // 1. Sequential duplicate POST returns replay
+    const extId = `sm52-seq-${Date.now()}`;
+    const reqBody = JSON.stringify({
+      source: 'manual',
+      externalMessageId: extId,
+      externalConversationId: `sm52-conv-seq-${Date.now()}`,
+      text: '55 bo:5 cai',
+      sender: { name: 'a.Long', phone: '0904813024' }
+    });
+    const r1 = await fetch(`${bootUrl}/api/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: reqBody
+    });
+    expect(r1.status).toBe(201);
+    const b1 = (await r1.json()) as IngestMessageApiResponse;
+    expect(b1.meta.idempotentReplay).toBe(false);
+
+    const r2 = await fetch(`${bootUrl}/api/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: reqBody
+    });
+    expect(r2.status).toBe(201);
+    const b2 = (await r2.json()) as IngestMessageApiResponse;
+    expect(b2.meta.idempotentReplay).toBe(true);
+    expect(b2.data.messageId).toBe(b1.data.messageId);
+    expect(b2.data.conversationId).toBe(b1.data.conversationId);
+    expect(b2.data.orderId).toBe(b1.data.orderId);
+
+    // 2. Concurrent duplicate POSTs converge to the same persisted result
+    const concExt = `sm52-conc-${Date.now()}`;
+    const concBody = JSON.stringify({
+      source: 'manual',
+      externalMessageId: concExt,
+      externalConversationId: `sm52-conv-conc-${Date.now()}`,
+      text: '55 bo:5 cai',
+      sender: { name: 'a.Long', phone: '0904813024' }
+    });
+    const concurrentResults = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        fetch(`${bootUrl}/api/v1/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: concBody
+        })
+      )
+    );
+    const concurrentBodies = (await Promise.all(
+      concurrentResults.map((r) => r.json())
+    )) as Array<IngestMessageApiResponse | ErrorApiResponse>;
+    const successBodies = concurrentBodies.filter((b) => b.success === true) as IngestMessageApiResponse[];
+    expect(successBodies.length).toBeGreaterThan(0);
+    const uniqueMsgIds = new Set(successBodies.map((b) => b.data.messageId));
+    expect(uniqueMsgIds.size).toBe(1);
+
+    // Verify database state: only ONE message + ONE conversation +
+    // ONE order, regardless of how concurrent the requests were.
+    const msgCount = await pool!.query(
+      `SELECT COUNT(*) AS count FROM messages
+       WHERE source = 'manual' AND external_message_id = $1`,
+      [concExt]
+    );
+    expect(Number(msgCount.rows[0].count)).toBe(1);
+
+    const singleMsgId = successBodies[0].data.messageId;
+    const singleConvId = successBodies[0].data.conversationId;
+    const orderCount = await pool!.query(
+      `SELECT COUNT(*) AS count FROM orders WHERE source_message_id = $1`,
+      [singleMsgId]
+    );
+    expect(Number(orderCount.rows[0].count)).toBe(1);
+
+    const convCount = await pool!.query(
+      `SELECT COUNT(*) AS count FROM conversations WHERE id = $1`,
+      [singleConvId]
+    );
+    expect(Number(convCount.rows[0].count)).toBe(1);
+
+    // Tear down the boot server
+    await boot.server.close();
+  });
+
+  it('does NOT provide a fake/mock IdempotencyLookup as a fallback', () => {
+    // The factory does NOT define a default lookup when none is
+    // provided — `create()` throws. The bootstrap helper always
+    // builds a real PG-backed lookup when none is injected.
+    expect(() => {
+      IngestMessageController.create({
+        invoker: async () => makePipelineResult(),
+        // idempotencyLookup intentionally omitted
+      } as any); // Cast to bypass the type guard; this is a runtime check.
+    }).toThrow(/idempotencyLookup/);
+  });
+});
+
+// Local helper used only in this file's tests
+function makePipelineResult(): import('../../src/services/MessageProcessingService.js').PipelineResult {
+  return {
+    messageId: 'm',
+    conversationId: 'conv',
+    correlationId: 'c',
+    rawText: 'r',
+    intent: 'order' as unknown as import('../../src/shared/enums.js').MessageIntent,
+    intentConfidence: 1.0,
+    items: [],
+    instructions: [],
+    invoiceRequired: false,
+    taskIds: [],
+    reviewRequired: false,
+    reviewReasons: [],
+    warnings: [],
+    metadata: {
+      processedAt: new Date().toISOString(),
+      processingDurationMs: 0,
+      parserVersion: '1.0.0',
+      ruleEngineVersion: '1.0.0'
+    }
+  };
+}

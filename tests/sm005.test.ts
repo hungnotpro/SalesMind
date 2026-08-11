@@ -256,7 +256,7 @@ describe('SM-005: IngestMessageController', () => {
     const idempotencyLookup: IdempotencyLookup = opts.existing !== undefined
       ? async () => opts.existing
       : async () => null;
-    return new IngestMessageController({
+    return IngestMessageController.createForTest({
       invoker,
       idempotencyLookup,
       generateId: (() => { let n = 0; return () => `fixed-id-${++n}`; })()
@@ -361,7 +361,7 @@ describe('SM-005: MessageApiServer (HTTP)', () => {
   let baseUrl: string;
 
   beforeEach(async () => {
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async (message) => makePipelineResult({ messageId: message.id }),
       idempotencyLookup: async () => null
     });
@@ -579,7 +579,7 @@ describe('SM-005: summarizeValidationIssues', () => {
 describe('SM-005: End-to-end pipeline via API', () => {
   it('controller receives a message with the canonical pipeline', async () => {
     let receivedMessage: Message | null = null;
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async (m) => {
         receivedMessage = m;
         return makePipelineResult({ messageId: m.id });
@@ -616,7 +616,7 @@ describe('SM-005.1: Issue 1 — conversationId in PipelineResult and response', 
   });
 
   it('API response uses result.conversationId (NOT messageId)', async () => {
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async (m) =>
         makePipelineResult({ messageId: m.id, conversationId: 'persisted-conv' })
     });
@@ -639,7 +639,7 @@ describe('SM-005.1: Issue 2 — idempotent replay returns the persisted messageI
   it('POST #2 returns the ORIGINAL persisted messageId', async () => {
     let invocations = 0;
     const existing = makePipelineResult({ messageId: 'persisted-msg', conversationId: 'persisted-conv', orderId: 'persisted-order' });
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async (m) => {
         invocations++;
         return makePipelineResult({ messageId: m.id });
@@ -665,7 +665,7 @@ describe('SM-005.1: Issue 2 — idempotent replay returns the persisted messageI
   });
 
   it('does NOT generate a new messageId on replay', async () => {
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async (m) => makePipelineResult({ messageId: m.id }),
       idempotencyLookup: async () =>
         makePipelineResult({ messageId: 'persisted-A', conversationId: 'persisted-B' }),
@@ -748,7 +748,7 @@ describe('SM-005.1: Issue 4 — concurrent idempotency', () => {
         detail: 'Key (source, external_message_id) = (manual, race-1) already exists.'
       }
     );
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async () => {
         throw uniqueViolation;
       },
@@ -775,7 +775,7 @@ describe('SM-005.1: Issue 4 — concurrent idempotency', () => {
       new Error('duplicate key value violates unique constraint'),
       { code: '23505', constraint: 'customers_phone_key', table: 'customers' }
     );
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async () => { throw otherViolation; },
       idempotencyLookup: async () => null
     });
@@ -803,7 +803,7 @@ describe('SM-005.1: Issue 4 — concurrent idempotency', () => {
 
 describe('SM-005.1: Issue 5 — safe processing error responses', () => {
   it('does NOT leak the original error message', async () => {
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async () => {
         throw new Error(
           'duplicate key value violates unique constraint "messages_source_external_unique"\nDETAIL: Key (source, external_message_id)=(manual, leak-1) already exists.\nFile: nbtinsert.c\nSQL: INSERT INTO messages ...'
@@ -833,7 +833,7 @@ describe('SM-005.1: Issue 5 — safe processing error responses', () => {
   });
 
   it('does NOT leak stack traces in any error code', async () => {
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async () => {
         const err = new Error('internal failure: connection refused at 127.0.0.1:5432');
         throw err;
@@ -881,7 +881,7 @@ describe('SM-005.1: Issue 6 — correlation ID preservation', () => {
   });
 
   it('controller echoes the requestId into the response', async () => {
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async (m) => makePipelineResult({ messageId: m.id })
     });
     const r = await ctrl.handle(
@@ -900,7 +900,7 @@ describe('SM-005.1: Issue 6 — correlation ID preservation', () => {
   });
 
   it('correlationId is distinct from messageId and conversationId', async () => {
-    const ctrl = new IngestMessageController({
+    const ctrl = IngestMessageController.createForTest({
       invoker: async (m) =>
         makePipelineResult({ messageId: m.id, conversationId: 'conv-distinct' })
     });
@@ -962,7 +962,7 @@ describe('SM-005.1: HTTP transport — correlation + safe errors', () => {
   let throwingCtrl: IngestMessageController;
 
   beforeEach(async () => {
-    throwingCtrl = new IngestMessageController({
+    throwingCtrl = IngestMessageController.createForTest({
       invoker: async () => {
         throw new Error(
           'pg: connection refused at /var/run/postgresql/.s.PGSQL.5432 (host=db.internal.example.com password=secret123)'
@@ -1069,7 +1069,7 @@ describe('SM-005.1: Concurrent duplicate requests', () => {
         table: 'messages'
       });
     };
-    const ctrl = new IngestMessageController({ invoker, idempotencyLookup: lookup });
+    const ctrl = IngestMessageController.createForTest({ invoker, idempotencyLookup: lookup });
 
     const req = {
       source: 'manual',
@@ -1112,7 +1112,7 @@ describe('SM-005.1: Concurrent duplicate requests', () => {
         table: 'messages'
       });
     };
-    const ctrl = new IngestMessageController({ invoker, idempotencyLookup: lookup });
+    const ctrl = IngestMessageController.createForTest({ invoker, idempotencyLookup: lookup });
     const r = await ctrl.handle({
       source: 'manual',
       externalMessageId: 'race-2',

@@ -168,10 +168,18 @@ const noopLogger: ApiLogger = {
 
 /**
  * Options for the controller.
+ *
+ * The `idempotencyLookup` field is **mandatory** for production wiring.
+ * The controller refuses to be constructed without it (see
+ * `IngestMessageController.create()`).
+ *
+ * For unit tests that intentionally exercise a controller without a
+ * persisted-database lookup, use `IngestMessageController.createForTest()`
+ * — a clearly-named test-only factory.
  */
 export interface IngestMessageControllerOptions {
   invoker: PipelineInvoker;
-  idempotencyLookup?: IdempotencyLookup;
+  idempotencyLookup: IdempotencyLookup;
   /**
    * Optional ID generator (for deterministic tests). Default: UUID.
    * The ID is used ONLY for the correlation/request ID and ONLY for
@@ -182,10 +190,78 @@ export interface IngestMessageControllerOptions {
   logger?: ApiLogger;
 }
 
+/**
+ * Internal options for the controller. Mirrors `IngestMessageControllerOptions`
+ * but marks `idempotencyLookup` as optional so the test-only factory
+ * (`IngestMessageController.createForTest`) can omit it. Production
+ * construction MUST go through `IngestMessageController.create()`,
+ * which requires `idempotencyLookup`.
+ */
+interface IngestMessageControllerInternalOptions {
+  invoker: PipelineInvoker;
+  idempotencyLookup?: IdempotencyLookup;
+  generateId?: () => string;
+  logger?: ApiLogger;
+}
+
+/**
+ * Test-only options. Makes `idempotencyLookup` optional so unit tests
+ * can exercise the controller in isolation without a real database.
+ * Never use this factory in production wiring.
+ */
+export interface IngestMessageControllerTestOptions {
+  invoker: PipelineInvoker;
+  /**
+   * When omitted, the controller behaves as if the lookup never finds
+   * an existing message (every request is treated as new). This is
+   * acceptable for unit tests; production wiring MUST supply a real
+   * lookup against the persisted database.
+   */
+  idempotencyLookup?: IdempotencyLookup;
+  generateId?: () => string;
+  logger?: ApiLogger;
+}
+
 export class IngestMessageController {
   private readonly logger: ApiLogger;
-  constructor(private readonly options: IngestMessageControllerOptions) {
+  private readonly idempotencyLookup?: IdempotencyLookup;
+  private readonly invoker: PipelineInvoker;
+  private readonly generateId: () => string;
+
+  private constructor(options: IngestMessageControllerInternalOptions) {
     this.logger = options.logger ?? noopLogger;
+    this.idempotencyLookup = options.idempotencyLookup;
+    this.invoker = options.invoker;
+    this.generateId = options.generateId ?? generateUUID;
+  }
+
+  /**
+   * Production factory.
+   *
+   * `idempotencyLookup` is mandatory at this layer. A controller
+   * constructed through this factory always uses a real database-
+   * backed lookup; there is no fallback path.
+   */
+  static create(options: IngestMessageControllerOptions): IngestMessageController {
+    if (!options.idempotencyLookup) {
+      throw new Error(
+        'IngestMessageController.create requires a non-null idempotencyLookup. ' +
+        'Use createForTest() only for unit tests; production wiring must ' +
+        'always supply a real database-backed IdempotencyLookup.'
+      );
+    }
+    return new IngestMessageController(options);
+  }
+
+  /**
+   * Test-only factory.
+   *
+   * Allows unit tests to construct the controller without a real
+   * database-backed lookup. Production code MUST use `create()`
+   * instead.
+   */
+  static createForTest(options: IngestMessageControllerTestOptions): IngestMessageController {
+    return new IngestMessageController(options);
   }
 
   /**
@@ -222,9 +298,9 @@ export class IngestMessageController {
     // 2. Idempotency pre-flight: if this message was processed before,
     //    return the EXISTING persisted result (with the original
     //    messageId and conversationId).
-    if (this.options.idempotencyLookup) {
+    if (this.idempotencyLookup) {
       try {
-        const existing = await this.options.idempotencyLookup(req.source, req.externalMessageId);
+        const existing = await this.idempotencyLookup(req.source, req.externalMessageId);
         if (existing) {
           this.logger.info('idempotent replay (pre-flight)', {
             requestId,
@@ -250,7 +326,7 @@ export class IngestMessageController {
     //    For a NEW message, this ID becomes the persisted ID.
     //    For a RACE-condition duplicate, the pipeline will throw a
     //    UNIQUE violation and we will re-read the persisted ID.
-    const messageId = (this.options.generateId ?? generateUUID)();
+    const messageId = this.generateId();
     const message: Message = {
       id: messageId,
       source: req.source,
@@ -273,16 +349,16 @@ export class IngestMessageController {
     //    reconstructed idempotent replay (handles concurrent races).
     let result: PipelineResult;
     try {
-      result = await this.options.invoker(message);
+      result = await this.invoker(message);
     } catch (err) {
       if (
         isUniqueViolation(err) &&
         isMessageIdUniqueViolation(err) &&
-        this.options.idempotencyLookup
+        this.idempotencyLookup
       ) {
         // A concurrent request created the message first. Re-read.
         try {
-          const existing = await this.options.idempotencyLookup(req.source, req.externalMessageId);
+          const existing = await this.idempotencyLookup(req.source, req.externalMessageId);
           if (existing) {
             this.logger.info('idempotent replay (post-unique-violation)', {
               requestId,
