@@ -211,7 +211,22 @@ export interface ProcessedCustomerInfo extends CustomerInfo {
 }
 
 export interface PipelineResult {
+  /**
+   * The ID of the persisted Message entity. This is the canonical,
+   * stable identifier for the message as returned to API clients.
+   *
+   * For idempotent replays, this MUST be the originally-persisted
+   * message ID — not a freshly-generated one.
+   */
   messageId: string;
+  /**
+   * The ID of the persisted Conversation entity that the message
+   * belongs to. Distinct from `messageId`: a single conversation
+   * may contain many messages.
+   *
+   * Always populated by `MessageProcessingService.processMessage`.
+   */
+  conversationId: string;
   correlationId: string;
   rawText: string;
   intent: MessageIntent;
@@ -452,6 +467,7 @@ export class MessageProcessingService {
     // ========================================
     return {
       messageId: message.id,
+      conversationId: conversation.id,
       correlationId: corrId,
       rawText: message.rawText,
       intent: parsingResult.intent,

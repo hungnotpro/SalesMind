@@ -1,7 +1,8 @@
 /**
  * SalesMind OS — public API surface.
  *
- * Exposes the controllers, validation, and HTTP transport for callers.
+ * Exposes the controllers, validation, HTTP transport, and read-model
+ * helpers for callers.
  *
  * Architecture:
  *
@@ -20,17 +21,23 @@
 
 export {
   IngestMessageController,
-  createMessageIdempotencyLookup,
+  reconstructPipelineResult,
   type IngestMessageApiRequest,
   type IngestMessageApiResponse,
   type ErrorApiResponse,
   type IngestMessageControllerOptions,
   type PipelineInvoker,
-  type IdempotencyLookup
+  type IdempotencyLookup,
+  type ApiLogger,
+  type PersistedMessageState,
+  type PersistedOrderItemState,
+  type PersistedTaskState,
+  type ExistingOrder
 } from './messages.js';
 
 export {
   MessageApiServer,
+  resolveRequestId,
   type ServerOptions
 } from './server.js';
 
@@ -39,5 +46,12 @@ export {
   summarizeValidationIssues,
   type MessageIngestionRequest,
   type ValidationIssue,
-  type ValidationResult
+  type ValidationResult,
+  type ValidationFailure,
+  type ValidationSuccess
 } from './validation/messageRequest.js';
+
+export {
+  isUniqueViolation,
+  type UniqueConstraintError
+} from './persistence-errors.js';

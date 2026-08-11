@@ -508,7 +508,7 @@ class InlineMessageProcessingService {
     }
 
     return {
-      messageId: message.id, correlationId: corrId, rawText: message.rawText, intent: parsingResult.intent, intentConfidence: parsingResult.intentConfidence, customerInfo: parsingResult.customerInfo, items: resolvedItems, instructions: parsingResult.instructions, discountRate: ruleResult.discountRate, paymentMethod: ruleResult.paymentMethod, invoiceRequired: ruleResult.invoiceRequired, orderId, taskIds: [], reviewRequired, reviewReasons, warnings, metadata: { processedAt: new Date().toISOString(), processingDurationMs: Date.now() - startTime, parserVersion: '1.0.0', ruleEngineVersion: '1.0.0' }
+      messageId: message.id, conversationId: 'conv-fixture', correlationId: corrId, rawText: message.rawText, intent: parsingResult.intent, intentConfidence: parsingResult.intentConfidence, customerInfo: parsingResult.customerInfo, items: resolvedItems, instructions: parsingResult.instructions, discountRate: ruleResult.discountRate, paymentMethod: ruleResult.paymentMethod, invoiceRequired: ruleResult.invoiceRequired, orderId, taskIds: [], reviewRequired, reviewReasons, warnings, metadata: { processedAt: new Date().toISOString(), processingDurationMs: Date.now() - startTime, parserVersion: '1.0.0', ruleEngineVersion: '1.0.0' }
     };
   }
 }

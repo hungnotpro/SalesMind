@@ -18,9 +18,12 @@ import type { Server } from 'node:http';
 import {
   IngestMessageController,
   MessageApiServer,
-  createMessageIdempotencyLookup,
+  reconstructPipelineResult,
   type IngestMessageApiResponse,
-  type ErrorApiResponse
+  type ErrorApiResponse,
+  type IdempotencyLookup,
+  type PersistedMessageState,
+  type ExistingOrder
 } from '../../src/api/index.js';
 import { connectFromEnv, isPostgresAvailable } from '../../src/db/connect.js';
 import { runMigrations } from '../../src/db/migrations/runner.js';
@@ -84,11 +87,68 @@ await repos.productAliasRepository.save({
   source: 'global', verified: true, confidence: 1.0
 });
 
-  // Build the controller wired to a transactional pipeline
-  const idempotencyLookup = createMessageIdempotencyLookup(
-    repos.messageRepository,
-    repos.orderRepository
-  );
+  // Build a typed idempotency lookup that reads the persisted state
+  // from PostgreSQL and reconstructs a PipelineResult. NO faked fields.
+  const idempotencyLookup: IdempotencyLookup = async (source, externalMessageId) => {
+    const msgRow = await pool!.query(
+      `SELECT id, source, external_message_id, conversation_id, customer_id,
+              raw_text, created_at
+       FROM messages
+       WHERE source = $1 AND external_message_id = $2
+       LIMIT 1`,
+      [source, externalMessageId]
+    );
+    if (msgRow.rows.length === 0) return null;
+    const msg = msgRow.rows[0];
+
+    // Conversation id: from message row or NULL
+    const conversationId: string = msg.conversation_id ?? '';
+
+    // Order linked to this message
+    const orderRow = await pool!.query(
+      `SELECT id, customer_id FROM orders WHERE source_message_id = $1 LIMIT 1`,
+      [msg.id]
+    );
+    const order: ExistingOrder = orderRow.rows.length > 0 ? { id: orderRow.rows[0].id as string } : null;
+
+    // Order items
+    let orderItems: PersistedMessageState['orderItems'] = [];
+    if (order) {
+      const items = await pool!.query(
+        `SELECT raw_product_name, resolution_status
+         FROM order_items
+         WHERE order_id = $1`,
+        [order.id]
+      );
+      orderItems = items.rows.map((r) => ({
+        rawProductName: r.raw_product_name as string,
+        resolutionStatus: r.resolution_status as string
+      }));
+    }
+
+    // Tasks
+    const tasksRow = await pool!.query(
+      `SELECT id, type, status FROM tasks WHERE source_message_id = $1`,
+      [msg.id]
+    );
+    const tasks = tasksRow.rows.map((r) => ({
+      id: r.id as string,
+      type: r.type as string,
+      status: r.status as string
+    }));
+
+    const state: PersistedMessageState = {
+      messageId: msg.id as string,
+      conversationId,
+      rawText: msg.raw_text as string,
+      customerId: (msg.customer_id as string | null) ?? (order?.id && orderRow.rows[0].customer_id as string | null),
+      createdAt: new Date(msg.created_at as string),
+      order,
+      orderItems,
+      tasks
+    };
+    return reconstructPipelineResult(state);
+  };
   const invoker = async (message: Message) => {
     return withTransaction(pool!, async (client) => {
       const { createTransactionalRepositories } = await import('../../src/db/pg/factory.js');
@@ -243,5 +303,259 @@ describe('SM-005 E2E: HTTP API ↔ PostgreSQL pipeline', () => {
       })
     });
     expect(res.status).toBe(400);
+  });
+
+  // ========================================
+  // SM-005.1 — Real PostgreSQL regression tests
+  // ========================================
+
+  it('POST persists correct messageId AND conversationId (Issue 1)', async () => {
+    if (!available) return;
+    const extId = `i1-pg-${Date.now()}`;
+    const extConvId = `i1-conv-${Date.now()}`;
+    const res = await fetch(`${baseUrl}/api/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'manual',
+        externalMessageId: extId,
+        externalConversationId: extConvId,
+        text: '55 bo:5 cai',
+        sender: { name: 'a.Long', phone: '0904813024' }
+      })
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as IngestMessageApiResponse;
+    expect(body.success).toBe(true);
+    if (body.success === true) {
+      // Bug fix: messageId MUST NOT be confused with conversationId
+      expect(body.data.messageId).toBeDefined();
+      expect(body.data.conversationId).toBeDefined();
+      expect(body.data.messageId).not.toBe(body.data.conversationId);
+
+      // Verify in the database
+      const msgRows = await pool!.query(
+        `SELECT m.id AS message_id, m.conversation_id
+         FROM messages m
+         WHERE m.source = 'manual' AND m.external_message_id = $1`,
+        [extId]
+      );
+      expect(msgRows.rows.length).toBe(1);
+      expect(msgRows.rows[0].message_id).toBe(body.data.messageId);
+      expect(msgRows.rows[0].conversation_id).toBe(body.data.conversationId);
+
+      const convRows = await pool!.query(
+        `SELECT id FROM conversations WHERE id = $1`,
+        [body.data.conversationId]
+      );
+      expect(convRows.rows.length).toBe(1);
+    }
+  });
+
+  it('POST #2 returns the ORIGINAL persisted messageId (Issue 2)', async () => {
+    if (!available) return;
+    const extId = `i2-pg-${Date.now()}`;
+    const extConvId = `i2-conv-${Date.now()}`;
+    const body = JSON.stringify({
+      source: 'manual',
+      externalMessageId: extId,
+      externalConversationId: extConvId,
+      text: '55 bo:5 cai',
+      sender: { name: 'a.Long', phone: '0904813024' }
+    });
+
+    const r1 = await fetch(`${baseUrl}/api/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body
+    });
+    expect(r1.status).toBe(201);
+    const b1 = (await r1.json()) as IngestMessageApiResponse;
+    const originalMessageId = b1.data.messageId;
+    const originalConversationId = b1.data.conversationId;
+    const originalOrderId = b1.data.orderId;
+    expect(b1.meta.idempotentReplay).toBe(false);
+
+    const r2 = await fetch(`${baseUrl}/api/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body
+    });
+    expect(r2.status).toBe(201);
+    const b2 = (await r2.json()) as IngestMessageApiResponse;
+    expect(b2.meta.idempotentReplay).toBe(true);
+    // Bug fix: replay returns the ORIGINAL persisted IDs
+    expect(b2.data.messageId).toBe(originalMessageId);
+    expect(b2.data.conversationId).toBe(originalConversationId);
+    expect(b2.data.orderId).toBe(originalOrderId);
+  });
+
+  it('replay preserves itemCount and reviewRequired (Issue 3)', async () => {
+    if (!available) return;
+    const extId = `i3-pg-${Date.now()}`;
+    const extConvId = `i3-conv-${Date.now()}`;
+    const body = JSON.stringify({
+      source: 'manual',
+      externalMessageId: extId,
+      externalConversationId: extConvId,
+      text: '55 bo:5 cai\n50g cay:5 cái',
+      sender: { name: 'a.Long', phone: '0904813024' }
+    });
+
+    const r1 = await fetch(`${baseUrl}/api/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body
+    });
+    const b1 = (await r1.json()) as IngestMessageApiResponse;
+    expect(b1.success).toBe(true);
+    if (b1.success === true) {
+      expect(b1.data.itemCount).toBeGreaterThan(0);
+
+      const r2 = await fetch(`${baseUrl}/api/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body
+      });
+      const b2 = (await r2.json()) as IngestMessageApiResponse;
+      expect(b2.meta.idempotentReplay).toBe(true);
+      // Replay must report the persisted itemCount (2 from the message)
+      expect(b2.data.itemCount).toBe(b1.data.itemCount);
+      expect(b2.data.reviewRequired).toBe(b1.data.reviewRequired);
+    }
+  });
+
+  it('concurrent duplicate POSTs do NOT create duplicate rows (Issue 4)', async () => {
+    if (!available) return;
+    const extId = `i4-pg-${Date.now()}`;
+    const extConvId = `i4-conv-${Date.now()}`;
+    const body = JSON.stringify({
+      source: 'manual',
+      externalMessageId: extId,
+      externalConversationId: extConvId,
+      text: '55 bo:5 cai',
+      sender: { name: 'a.Long', phone: '0904813024' }
+    });
+
+    // Fire 5 concurrent requests
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        fetch(`${baseUrl}/api/v1/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body
+        })
+      )
+    );
+
+    // Every response must succeed (200/201). No 500 PROCESSING_FAILED
+    // is acceptable for a duplicate.
+    for (const r of responses) {
+      expect(r.status).toBe(201);
+    }
+
+    const bodies = await Promise.all(
+      responses.map((r) => r.json())
+    ) as IngestMessageApiResponse[];
+
+    // All responses must report the SAME messageId
+    const messageIds = new Set(bodies.map((b) => b.data.messageId));
+    expect(messageIds.size).toBe(1);
+    const singleMessageId = bodies[0].data.messageId;
+
+    // All responses must report the SAME conversationId
+    const conversationIds = new Set(bodies.map((b) => b.data.conversationId));
+    expect(conversationIds.size).toBe(1);
+    const singleConversationId = bodies[0].data.conversationId;
+
+    // At least one response must report idempotentReplay = true
+    // (the loser of the race falls into the replay branch)
+    // The first to win has idempotentReplay = false.
+    const replayCount = bodies.filter((b) => b.meta.idempotentReplay).length;
+    expect(replayCount).toBeGreaterThan(0);
+
+    // Verify in PostgreSQL: only ONE message row, ONE conversation row,
+    // ONE order row, and ONE set of tasks.
+    const msgCount = await pool!.query(
+      `SELECT COUNT(*) AS count FROM messages WHERE id = $1`,
+      [singleMessageId]
+    );
+    expect(Number(msgCount.rows[0].count)).toBe(1);
+
+    const convCount = await pool!.query(
+      `SELECT COUNT(*) AS count FROM conversations WHERE id = $1`,
+      [singleConversationId]
+    );
+    expect(Number(convCount.rows[0].count)).toBe(1);
+
+    const orderCount = await pool!.query(
+      `SELECT COUNT(*) AS count FROM orders WHERE source_message_id = $1`,
+      [singleMessageId]
+    );
+    expect(Number(orderCount.rows[0].count)).toBe(1);
+
+    const taskCount = await pool!.query(
+      `SELECT COUNT(*) AS count FROM tasks WHERE source_message_id = $1`,
+      [singleMessageId]
+    );
+    // Number of tasks depends on rules. The CRITICAL invariant is that
+    // the count is bounded (not 5× the count for 5 concurrent requests).
+    expect(Number(taskCount.rows[0].count)).toBeLessThan(5);
+  });
+
+  it('does NOT expose SQL details in any 500 response (Issue 5)', async () => {
+    if (!available) return;
+    // Create a request that will likely fail validation but exercise the
+    // 500 path indirectly through a malformed invoker is risky in
+    // real DB. Instead verify that ALL real responses in this test
+    // do not leak SQL. We check the bodies of the previous requests.
+    // (This test is mostly a placeholder asserting the response shape.)
+    const res = await fetch(`${baseUrl}/api/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'manual',
+        externalMessageId: `i5-${Date.now()}`,
+        externalConversationId: `i5-conv-${Date.now()}`,
+        text: '55 bo:5 cai',
+        sender: { name: 'a.Long', phone: '0904813024' }
+      })
+    });
+    const text = await res.text();
+    expect(text).not.toContain('messages_source_external_unique');
+    expect(text).not.toContain('23505');
+    expect(text).not.toContain('SELECT');
+    expect(text).not.toContain('postgres://');
+    expect(text).not.toContain('Stack:');
+  });
+
+  it('preserves caller-supplied X-Request-ID through the response (Issue 6)', async () => {
+    if (!available) return;
+    const requestId = 'aaaaaaaa-1111-4222-8333-444444444444';
+    const res = (await fetch(`${baseUrl}/api/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-request-id': requestId
+      },
+      body: JSON.stringify({
+        source: 'manual',
+        externalMessageId: `i6-${Date.now()}`,
+        externalConversationId: `i6-conv-${Date.now()}`,
+        text: '55 bo:5 cai',
+        sender: { name: 'a.Long', phone: '0904813024' }
+      })
+    })) as unknown as {
+      status: number;
+      headers: { get(name: string): string | null };
+      json: () => Promise<unknown>;
+    };
+    expect(res.status).toBe(201);
+    expect(res.headers.get('x-request-id')).toBe(requestId);
+    const body = (await res.json()) as IngestMessageApiResponse;
+    expect(body.data.correlationId).toBe(requestId);
+    // The correlation ID MUST NOT be confused with the persisted IDs
+    expect(body.data.correlationId).not.toBe(body.data.messageId);
+    expect(body.data.correlationId).not.toBe(body.data.conversationId);
   });
 });

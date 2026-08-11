@@ -7,9 +7,26 @@
  *   - Routing
  *   - Status code selection
  *   - Error envelope serialization
+ *   - Correlation ID (X-Request-ID) preservation
  *
  * All business logic lives in the controller (IngestMessageController).
  * All persistence lives in the application pipeline.
+ *
+ * Correlation ID:
+ *
+ *   The transport reads the `X-Request-ID` request header. If present
+ *   AND well-formed (UUID v4), the transport preserves it across the
+ *   request and includes it in:
+ *     - the `X-Request-ID` response header
+ *     - the `error.requestId` / `data.correlationId` fields
+ *
+ *   Otherwise the transport generates a fresh UUID and uses it
+ *   consistently.
+ *
+ *   The correlation ID is distinct from:
+ *     - messageId      (persisted Message ID)
+ *     - conversationId (persisted Conversation ID)
+ *     - externalMessageId  (caller-supplied upstream ID)
  *
  * Design notes:
  *
@@ -34,6 +51,27 @@ export interface ServerOptions {
   host?: string;
 }
 
+/**
+ * UUID v4 regex. Accepted as a caller-supplied correlation ID only
+ * when it matches this format. Otherwise a fresh ID is generated.
+ */
+const UUID_V4_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+type HeaderBag = Record<string, string | string[] | undefined>;
+
+/**
+ * Resolve the request ID for an incoming request. Preserves a
+ * caller-supplied X-Request-ID when valid; otherwise generates one.
+ */
+export function resolveRequestId(headers: HeaderBag): string {
+  const raw = headers['x-request-id'];
+  if (typeof raw === 'string' && UUID_V4_RE.test(raw.trim())) {
+    return raw.trim();
+  }
+  return generateUUID();
+}
+
 export class MessageApiServer {
   private server?: Server;
   constructor(private readonly controller: IngestMessageController, private readonly opts: ServerOptions = {}) {}
@@ -45,15 +83,20 @@ export class MessageApiServer {
     return new Promise((resolve, reject) => {
       const server = createServer((req, res) => {
         this.handle(req, res).catch((err) => {
-          // Last-resort safety net
+          // Last-resort safety net: log internally, return generic envelope.
+          const requestId = resolveRequestId(req.headers);
           this.sendJson(res, 500, {
             success: false,
             error: {
               code: 'INTERNAL_ERROR',
-              message: err instanceof Error ? err.message : 'Internal error',
-              requestId: this.requestId()
+              message: 'An internal error occurred.',
+              requestId
             }
-          });
+          }, requestId);
+          // Surface to stderr for server-side diagnostics. The stack
+          // trace stays out of the HTTP response.
+          // eslint-disable-next-line no-console
+          console.error('[salesmind-api] unhandled error', err);
         });
       });
       server.on('error', reject);
@@ -82,7 +125,7 @@ export class MessageApiServer {
    * Handle a single request. Exposed for testing.
    */
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const requestId = this.requestId();
+    const requestId = resolveRequestId(req.headers);
 
     // CORS preflight: not implemented (no browser clients in scope)
     if (req.method === 'OPTIONS') {
@@ -132,12 +175,11 @@ export class MessageApiServer {
     try {
       raw = await readBody(req, MAX_BODY_BYTES);
     } catch (err) {
-      const message = (err as Error).message;
       this.sendJson(res, 400, {
         success: false,
         error: {
           code: 'VALIDATION_ERROR',
-          message: `Failed to read body: ${message}`,
+          message: 'Failed to read request body.',
           requestId
         }
       }, requestId);
@@ -153,15 +195,15 @@ export class MessageApiServer {
         success: false,
         error: {
           code: 'VALIDATION_ERROR',
-          message: 'Request body is not valid JSON',
+          message: 'Request body is not valid JSON.',
           requestId
         }
       }, requestId);
       return;
     }
 
-    // Delegate to the controller
-    const result = await this.controller.handle(body);
+    // Delegate to the controller, passing the preserved request ID
+    const result = await this.controller.handle(body, requestId);
 
     if (result.success === true) {
       // Successful ingestion: 201 Created (per API_SPEC.md convention)
@@ -184,10 +226,6 @@ export class MessageApiServer {
       ...(requestId ? { 'x-request-id': requestId } : {})
     });
     res.end(payload);
-  }
-
-  private requestId(): string {
-    return generateUUID();
   }
 }
 
